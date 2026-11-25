@@ -95,10 +95,12 @@ build.bat
 ## 测试
 
 ```bash
-python test_geo.py
+python test_geo.py    # 定位：用例来自真实帖子中出现过的定位错误
+python test_core.py   # 租金/薪金识别、Excel 导出、日志
+python test_gui.py    # 窗口布局、高 DPI、错误提示（会短暂打开窗口）
 ```
 
-定位逻辑的回归测试，用例来自真实帖子中出现过的定位错误。
+测试使用临时数据目录，不会读写你的配置和缓存。`build.bat` 会先跑全部测试，通过后才打包。
 
 ## 项目结构
 
@@ -106,7 +108,10 @@ python test_geo.py
 skykiwi_scraper.py   抓取、筛选、导出、图形界面、命令行
 geo.py               位置识别、地址解析、一键定位、距离计算
 nz_places.py         内置地名坐标（来源：OpenStreetMap）
+version.py           版本号
 test_geo.py          定位回归测试
+test_core.py         核心逻辑测试
+test_gui.py          界面测试
 build.bat            打包脚本
 CHANGELOG.md         版本记录
 ```
@@ -116,3 +121,4 @@ CHANGELOG.md         版本记录
 - 只访问天维网 `robots.txt` 允许的页面（版块列表和帖子），限制了并发数并在请求之间留有间隔，请勿调高频率
 - 抓取到的联系方式等信息仅供个人查找房源和工作使用
 - 程序依赖网站当前的页面结构，网站改版后可能需要调整
+- 程序出错时，详细信息写在 `%APPDATA%\SkykiwiScraper\app.log`，反馈问题时请附上这个文件

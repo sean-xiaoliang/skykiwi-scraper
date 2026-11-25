@@ -1,0 +1,2 @@
+# Windows 批处理必须是 CRLF, 否则 goto/标签可能失效
+*.bat text eol=crlf

@@ -27,12 +27,15 @@ from typing import NamedTuple
 import requests
 
 from nz_places import PLACES
+from version import __version__
 
-APP_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "SkykiwiScraper")
+# 数据目录 (配置、缓存、日志); 环境变量 SKYKIWI_APP_DIR 可覆盖 (测试用)
+APP_DIR = os.environ.get("SKYKIWI_APP_DIR") or os.path.join(
+    os.environ.get("APPDATA") or os.path.expanduser("~"), "SkykiwiScraper")
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 CACHE_FILE = os.path.join(APP_DIR, "geocache2.json")
 NOMINATIM = "https://nominatim.openstreetmap.org/search"
-GEO_UA = "SkykiwiScraper/1.2 (desktop app)"
+GEO_UA = f"SkykiwiScraper/{__version__} (desktop app)"
 
 # 别名 -> PLACES 中的标准名 (中文叫法、拼写变体、地标)。键会经过 _norm (小写、繁转简、去撇号)
 ALIASES = {

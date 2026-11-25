@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import datetime as dt
 import os
 import queue
@@ -34,7 +35,7 @@ from bs4 import BeautifulSoup
 
 import geo
 
-__version__ = "1.0.0"
+from version import __version__  # noqa: E402
 
 BASE = "https://bbs.skykiwi.com/"
 USER_AGENT = (
@@ -299,10 +300,10 @@ class Scraper:
     @staticmethod
     def _post_process(it: Listing):
         if it.category == "rent":
-            it.price = parse_price(it.price_text) or guess_price_from_text(it.title)
+            it.price = parse_rent(it.price_text) or guess_price_from_text(it.title)
         else:
-            # 薪金字段多为 "高于最低工资" 这类档位;优先取其中数字,否则从标题/正文猜时薪
-            it.salary_num = (parse_price(it.salary) or guess_wage_from_text(it.title)
+            # 薪金字段多为 "高于最低工资" 这类档位;能按单位换算出时薪就用, 否则从标题/正文猜时薪
+            it.salary_num = (parse_wage(it.salary) or guess_wage_from_text(it.title)
                              or guess_wage_from_text(it.content))
             if not it.location:
                 it.location = it.extra.get("地点", "")
@@ -409,6 +410,48 @@ def parse_price(text: str) -> float | None:
         return None
     v = float(m.group(1))
     return v if v > 0 else None
+
+
+RENT_RANGE = (50, 5000)      # 合理的周租金 (NZD)
+WAGE_RANGE = (15, 200)       # 合理的时薪 (NZD)
+_HOURS = {"year": 2080, "month": 173.3, "week": 40, "day": 8, "hour": 1}
+
+
+def parse_rent(text: str) -> float | None:
+    """周租金字段 -> 数值。优先取 $ 后面的数字, 只接受合理区间, 过滤 '88888' 之类占位数。"""
+    if not text:
+        return None
+    t = text.replace(",", "")
+    nums = [(m.group(1) is not None, float(m.group(2)))
+            for m in re.finditer(r"([\$＄]\s*)?(\d+(?:\.\d+)?)", t)]
+    ok = [(dollar, v) for dollar, v in nums if RENT_RANGE[0] <= v <= RENT_RANGE[1]]
+    for dollar, v in ok:
+        if dollar:
+            return v
+    return ok[0][1] if ok else None
+
+
+def parse_wage(text: str) -> float | None:
+    """薪金文本 -> 估算时薪。识别 年/月/周/天/小时 和 k, 换算后只接受合理区间。"""
+    if not text:
+        return None
+    t = text.lower().replace(",", "")
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(k)?(?![\d.])", t)
+    if not m:
+        return None
+    v = float(m.group(1)) * (1000 if m.group(2) else 1)
+    if m.group(2) or re.search(r"年薪|/\s*年|每年|per\s*annum|(?<![a-z])p\.?a\.?(?![a-z])|annual|year|/\s*yr", t):
+        unit = "year"
+    elif re.search(r"月薪|/\s*月|每月|month", t):
+        unit = "month"
+    elif re.search(r"周薪|/\s*周|每周|week|(?<![a-z])p/?w(?![a-z])", t):
+        unit = "week"
+    elif re.search(r"日薪|/\s*天|每天|/\s*day|per\s*day|daily", t):
+        unit = "day"
+    else:
+        unit = "hour"
+    hourly = v / _HOURS[unit]
+    return round(hourly, 1) if WAGE_RANGE[0] <= hourly <= WAGE_RANGE[1] else None
 
 
 def guess_price_from_text(text: str) -> float | None:
@@ -523,6 +566,16 @@ def columns_for(category: str):
     return RENT_COLUMNS if category == "rent" else JOB_COLUMNS
 
 
+def _excel_safe(v):
+    """去掉 Excel 不允许的控制字符; None -> 空字符串。"""
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+        return ILLEGAL_CHARACTERS_RE.sub("", v)
+    return v
+
+
 def export_excel(items: list[Listing], category: str, path: str) -> str:
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
@@ -545,8 +598,11 @@ def export_excel(items: list[Listing], category: str, path: str) -> str:
         row = []
         for k, _, _ in cols:
             v = getattr(it, k, "")
-            row.append("" if v is None else v)
+            row.append(_excel_safe(v))
         ws.append(row)
+        for c in ws[ws.max_row]:   # 帖子内容来自网友: 以 = 开头的也只当文本, 不当公式
+            if isinstance(c.value, str) and c.value.startswith("="):
+                c.data_type = "s"
         c = ws.cell(row=ws.max_row, column=link_col)
         c.hyperlink = it.url
         c.font = Font(color="0563C1", underline="single")
@@ -562,7 +618,7 @@ def export_excel(items: list[Listing], category: str, path: str) -> str:
         ws2 = wb.create_sheet("其他字段")
         ws2.append(["tid", "标题", "字段", "内容"])
         for it, k, v in extras:
-            ws2.append([it.tid, it.title, k, v])
+            ws2.append([it.tid, _excel_safe(it.title), _excel_safe(k), _excel_safe(v)])
     wb.save(path)
     return path
 
@@ -665,20 +721,45 @@ def run_cli(argv=None):
 
 # ---------------------------------------------------------------- 图形界面 ----
 
+def enable_dpi_awareness() -> bool:
+    """声明进程支持高 DPI (Windows)。否则在 125%/150% 缩放下系统会把窗口位图拉伸, 文字发虚。"""
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)   # PROCESS_SYSTEM_DPI_AWARE
+        except (AttributeError, OSError):
+            ctypes.windll.user32.SetProcessDPIAware()
+        return True
+    except (AttributeError, OSError):
+        return False
+
+
 def run_gui():
     import tkinter as tk
     from tkinter import ttk, messagebox, filedialog
 
+    import tkinter.font as tkfont
+
+    enable_dpi_awareness()          # 必须在创建窗口之前: 高分屏下文字清晰, 不被拉伸
     root = tk.Tk()
     root.title(f"天维网 租房 / 招聘 信息抓取工具 v{__version__}")
-    root.geometry("1280x780")
-    try:
-        root.tk.call("tk", "scaling", 1.25)
-    except tk.TclError:
-        pass
+    ui = root.winfo_fpixels("1i") / 96.0          # 屏幕缩放比例 (100% = 1.0, 150% = 1.5)
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    W, H = min(int(1280 * ui), int(sw * 0.94)), min(int(800 * ui), int(sh * 0.86))
+    root.geometry(f"{W}x{H}+{max(0, (sw - W) // 2)}+{max(0, (sh - H) // 3)}")
+    root.minsize(int(760 * ui), int(420 * ui))
     style = ttk.Style()
     if "vista" in style.theme_names():
         style.theme_use("vista")
+    line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+    style.configure("Treeview", rowheight=int(line * 1.45))
+
+    log_path = setup_logging()
+
+    def on_callback_error(exc_type, exc, tb):
+        log.error("界面操作出错", exc_info=(exc_type, exc, tb))
+        messagebox.showerror("程序出错", f"{exc_type.__name__}: {exc}\n\n详细信息已写入日志:\n{log_path}")
+    root.report_callback_exception = on_callback_error
 
     state = {"items": {"rent": [], "job": []}, "shown": [], "running": False, "stop": None, "home": None}
     msgq: queue.Queue = queue.Queue()
@@ -794,11 +875,12 @@ def run_gui():
     mid.rowconfigure(0, weight=1)
     mid.columnconfigure(0, weight=1)
 
-    detail = tk.Text(root, height=6, wrap="word")
-    detail.pack(fill="x", padx=8)
-
+    # 底栏和详情区先于结果表分配空间 (side=bottom, before=mid): 窗口变矮时只压缩结果表,
+    # 导出按钮始终可见
     bottom = ttk.Frame(root, padding=8)
-    bottom.pack(fill="x")
+    bottom.pack(side="bottom", fill="x", before=mid)
+    detail = tk.Text(root, height=6, wrap="word")
+    detail.pack(side="bottom", fill="x", padx=8, before=mid)
     count_var = tk.StringVar(value="")
     ttk.Label(bottom, textvariable=count_var).pack(side="left")
     ttk.Button(bottom, text="导出 Excel (当前筛选结果)", command=lambda: do_export()).pack(side="right")
@@ -908,7 +990,7 @@ def run_gui():
         tree["columns"] = [k for k, _, _ in cols]
         for k, h, w in cols:
             tree.heading(k, text=h, command=lambda kk=k: sort_by(kk))
-            tree.column(k, width=int(w * 8), minwidth=40, stretch=(k == "title"))
+            tree.column(k, width=int(w * 8 * ui), minwidth=int(40 * ui), stretch=(k == "title"))
 
     def build_type_checks():
         for w in type_frame.winfo_children():
@@ -1096,6 +1178,10 @@ def run_gui():
         except PermissionError:
             messagebox.showerror("导出失败", "文件被占用,请先关闭 Excel 中已打开的同名文件")
             return
+        except Exception as e:  # noqa: BLE001
+            log.exception("导出 Excel 失败: %s", path)
+            messagebox.showerror("导出失败", f"{type(e).__name__}: {e}\n\n详细信息已写入日志:\n{log_path}")
+            return
         if messagebox.askyesno("导出完成", f"已导出 {len(state['shown'])} 条到\n{path}\n\n是否立即打开?"):
             try:
                 os.startfile(path)  # type: ignore[attr-defined]
@@ -1201,12 +1287,40 @@ def run_gui():
                             refresh_table()
         except queue.Empty:
             pass
-        root.after(150, poll)
+        state["poll_id"] = root.after(150, poll)
+
+    def on_destroy(e):
+        if e.widget is root and state.get("poll_id"):
+            root.after_cancel(state["poll_id"])   # 关窗后不再触发轮询
+    root.bind("<Destroy>", on_destroy, add="+")
 
     show_home_status()
     on_cat_change()
     poll()
     root.mainloop()
+
+
+log = logging.getLogger("skykiwi")
+
+
+def setup_logging() -> str:
+    """日志写到 <数据目录>/app.log (最多约 3 MB), 并记录所有未处理的异常。返回日志路径。"""
+    from logging.handlers import RotatingFileHandler
+    path = os.path.join(geo.APP_DIR, "app.log")
+    if not any(getattr(h, "baseFilename", None) == os.path.abspath(path) for h in log.handlers):
+        os.makedirs(geo.APP_DIR, exist_ok=True)
+        h = RotatingFileHandler(path, maxBytes=1_000_000, backupCount=2, encoding="utf-8")
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s"))
+        log.addHandler(h)
+        log.setLevel(logging.INFO)
+
+        def on_exc(exc_type, exc, tb):
+            log.error("未处理的异常", exc_info=(exc_type, exc, tb))
+            sys.__excepthook__(exc_type, exc, tb)
+        sys.excepthook = on_exc
+        threading.excepthook = lambda a: log.error(
+            "后台线程未处理的异常", exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
+    return path
 
 
 def main():
@@ -1219,6 +1333,8 @@ def main():
                 getattr(sys, name).reconfigure(errors="replace")
             except (AttributeError, ValueError):
                 pass
+    setup_logging()
+    log.info("启动 v%s %s", __version__, " ".join(sys.argv[1:]))
     if len(sys.argv) > 1:
         run_cli()
     else:
