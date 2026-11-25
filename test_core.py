@@ -99,6 +99,148 @@ def test_setup_logging_writes_file():
         assert "测试日志 xyz" in f.read()
 
 
+# ==================== v1.1.0 ====================
+
+# ---- 默认排除已租 / 已招满 ----
+def test_exclude_taken_posts():
+    items = [k.Listing(tid=1, category="rent", title="Albany 双人房出租"),
+             k.Listing(tid=2, category="rent", title="已租"),
+             k.Listing(tid=3, category="job", title="招聘服务员（已招到）")]
+    kept = k.apply_filters(items, k.Criteria(exclude_taken=True))
+    assert [it.tid for it in kept] == [1], [it.tid for it in kept]
+    assert len(k.apply_filters(items, k.Criteria(exclude_taken=False))) == 3
+
+
+# ---- 距离显示: 精度不同显示方式不同 ----
+def _loc(level, d):
+    it = k.Listing(tid=1, category="rent")
+    it.loc_level, it.distance = level, d
+    return it
+
+
+def test_format_distance():
+    assert k.format_distance(_loc("地址", 2.34)) == "2.3"
+    assert k.format_distance(_loc("街道", 0.42)) == "0.4"
+    assert k.format_distance(_loc("街区", 0.0)) == "<1"
+    assert k.format_distance(_loc("街区", 3.26)) == "3.3"
+    assert k.format_distance(_loc("区域", 4.5)) == "≈5"
+    assert k.format_distance(_loc("区域", 0.3)) == "≈1"
+    assert k.format_distance(_loc("", None)) == ""
+
+
+# ---- 排序: 指定列, None 永远在最后 ----
+def test_sort_listings_by_price_none_last():
+    a, b, c = (k.Listing(tid=i, category="rent") for i in range(3))
+    a.price, b.price, c.price = 300.0, None, 200.0
+    assert [x.tid for x in k.sort_listings([a, b, c], "price", False)] == [2, 0, 1]
+    assert [x.tid for x in k.sort_listings([a, b, c], "price", True)] == [0, 2, 1]
+
+
+# ---- 命令行入口判断 ----
+def test_is_cli():
+    assert k.is_cli(["app.exe", "--cli", "--category", "rent"])
+    assert k.is_cli(["app.exe", "--version"])
+    assert not k.is_cli(["app.exe"])
+    assert not k.is_cli(["app.exe", r"C:\some\dragged file.txt"])
+
+
+# ---- 抓取: 4xx 不重试; 列表页中途失败保留已抓的页; 停止时保留数据 ----
+class _Resp:
+    def __init__(self, status, text=""):
+        self.status_code, self.text, self.encoding, self.apparent_encoding = status, text, "utf-8", "utf-8"
+
+    def raise_for_status(self):
+        import requests
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code}", response=self)
+
+
+def test_get_does_not_retry_client_errors():
+    sc = k.Scraper(delay=0)
+    calls = []
+
+    class S:
+        headers = {}
+
+        def get(self, url, timeout):
+            calls.append(url)
+            return _Resp(404)
+    sc._local.s = S()
+    try:
+        sc.get("https://example.invalid/x")
+    except Exception:  # noqa: BLE001
+        pass
+    assert len(calls) == 1, f"404 被重试了 {len(calls)} 次"
+
+
+def _list_page(tids, date):
+    rows = "".join(
+        f'<tbody id="normalthread_{t}"><tr><th><a href="forum.php?mod=viewthread&tid={t}" class="xst">帖子{t}</a></th>'
+        f'<td class="by"><cite><a>u</a></cite><em><span>{date}</span></em></td>'
+        f'<td class="num"><a>1</a><em>2</em></td></tr></tbody>' for t in tids)
+    return f"<html><body><table>{rows}</table></body></html>"
+
+
+def test_list_failure_keeps_earlier_pages():
+    import datetime as dt
+    today = dt.date.today().isoformat()
+    sc = k.Scraper(delay=0, log=lambda m: None)
+    pages = {1: _list_page([11, 12], today)}
+
+    def fake_get(url, retries=3):
+        page = int(url.rsplit("page=", 1)[1])
+        if page in pages:
+            return pages[page]
+        raise RuntimeError("请求失败: 模拟第 2 页出错")
+    sc.get = fake_get
+    items = sc.list_threads("rent", 10)
+    assert sorted(it.tid for it in items) == [11, 12], items
+
+
+def test_stop_during_list_keeps_data():
+    import datetime as dt
+    today = dt.date.today().isoformat()
+    sc = k.Scraper(delay=0, log=lambda m: None)
+
+    def fake_get(url, retries=3):
+        page = int(url.rsplit("page=", 1)[1])
+        if page == 1:
+            return _list_page([21, 22], today)
+        raise InterruptedError("已停止")
+    sc.get = fake_get
+    items = sc.list_threads("rent", 10)
+    assert sorted(it.tid for it in items) == [21, 22]
+
+
+# ---- 地图服务: 全进程共享一个实例 ----
+def test_geocoder_singleton():
+    assert geo.get_geocoder() is geo.get_geocoder()
+
+
+# ---- 配置: 原子写入, 文件损坏时备份而不是静默清空 ----
+def test_config_atomic_and_corrupt_backup():
+    geo.save_config({"home_text": "A"})
+    assert geo.load_config()["home_text"] == "A"
+    with open(geo.CONFIG_FILE, "w", encoding="utf-8") as f:
+        f.write("{坏的 json")
+    assert geo.load_config() == {}
+    assert os.path.exists(geo.CONFIG_FILE + ".bad"), "损坏的配置没有备份"
+    assert not [n for n in os.listdir(geo.APP_DIR) if n.endswith(".tmp")], "残留临时文件"
+
+
+# ---- 英文描述中的 close / view 不是街道名 ----
+def test_ambiguous_street_words():
+    assert geo.match_place("Nice room in Takapuna close to the beach") == "Takapuna"
+    assert geo.match_place("Albany view apartment") == "Albany"
+    assert geo.match_place("CBD市中心 Nelson Street") == "Auckland CBD"   # 真正的街道名仍跳过
+
+
+# ---- 打包的 exe 是 引导进程 -> Python 进程 两层: 要能找到祖父进程 (启动它的 cmd) ----
+def test_parent_pid_lookup():
+    assert k._parent_pid(os.getpid()) == os.getppid()
+    assert k._parent_pid(0x7FFFFFF0) is None
+
+
 if __name__ == "__main__":
     import traceback
     fails = 0

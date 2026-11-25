@@ -21,12 +21,10 @@ import argparse
 import logging
 import datetime as dt
 import os
-import queue
 import re
 import sys
 import threading
 import time
-import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
@@ -36,6 +34,9 @@ from bs4 import BeautifulSoup
 import geo
 
 from version import __version__  # noqa: E402
+
+log = logging.getLogger("skykiwi")
+log.addHandler(logging.NullHandler())   # 未调用 setup_logging 时 (如测试) 不输出到终端
 
 BASE = "https://bbs.skykiwi.com/"
 USER_AGENT = (
@@ -154,7 +155,7 @@ class Listing:
 # ---------------------------------------------------------------- 抓取 ----
 
 class Scraper:
-    def __init__(self, delay: float = 0.4, workers: int = 4, timeout: int = 20,
+    def __init__(self, delay: float = 0.3, workers: int = 4, timeout: int = 20,
                  log=print, stop_event: threading.Event | None = None):
         self.delay = delay
         self.workers = max(1, workers)
@@ -172,33 +173,62 @@ class Scraper:
             self._local.s = s
         return s
 
+    # 所有线程共享的请求节流: 相邻两次请求至少间隔 delay 秒 (对论坛友好)
+    _rate_lock = threading.Lock()
+    _last_request = 0.0
+
+    def _throttle(self):
+        with Scraper._rate_lock:
+            wait = self.delay - (time.time() - Scraper._last_request)
+            if wait > 0:
+                time.sleep(wait)
+            Scraper._last_request = time.time()
+
     def get(self, url: str, retries: int = 3) -> str:
         last = None
         for i in range(retries):
             if self.stop_event.is_set():
                 raise InterruptedError("已停止")
+            self._throttle()
             try:
                 r = self._session().get(url, timeout=self.timeout)
                 r.raise_for_status()
                 r.encoding = r.apparent_encoding if not r.encoding or r.encoding.lower() == "iso-8859-1" else r.encoding
-                time.sleep(self.delay)
                 return r.text
+            except requests.HTTPError as e:
+                code = getattr(e.response, "status_code", 0) or 0
+                if 400 <= code < 500 and code != 429:   # 404/403 等重试也没用
+                    raise RuntimeError(f"请求失败: {url} (HTTP {code})") from e
+                last = e
             except requests.RequestException as e:
                 last = e
-                time.sleep(1.5 * (i + 1))
+            time.sleep(1.5 * (i + 1))
         raise RuntimeError(f"请求失败: {url} ({last})")
 
     # ---- 列表页 ----
-    def list_threads(self, category: str, days: int, max_pages: int = 30,
+    def list_threads(self, category: str, days: int, max_pages: int = 40,
                      progress=None) -> list[Listing]:
         cfg = CATEGORIES[category]
-        cutoff = (dt.date.today() - dt.timedelta(days=days - 1)) if days > 0 else dt.date.min
+        days = max(1, int(days))
+        cutoff = dt.date.today() - dt.timedelta(days=days - 1)
         results: dict[int, Listing] = {}
         for page in range(1, max_pages + 1):
             url = (f"{BASE}forum.php?mod=forumdisplay&fid={cfg['fid']}"
                    f"&filter=author&orderby=dateline&page={page}")
             self.log(f"读取列表第 {page} 页 ...")
-            html = self.get(url)
+            try:
+                html = self.get(url)
+            except InterruptedError:
+                self.log("已停止, 保留已读取的列表")
+                break
+            except RuntimeError as e:
+                if not results:
+                    raise
+                log.warning("列表第 %d 页读取失败, 保留前 %d 条: %s", page, len(results), e)
+                self.log(f"第 {page} 页读取失败, 保留已读取的 {len(results)} 条")
+                break
+            if page == max_pages:
+                self.log(f"已达到最多 {max_pages} 页的上限, 更早的帖子未读取")
             rows, normal_dates = self._parse_list(html, category)
             for it in rows:
                 d = _to_date(it.post_date)
@@ -350,7 +380,7 @@ class Scraper:
 def locate_items(items: list[Listing], online_geocode: bool = True, log=print, progress=None,
                  stop_event: threading.Event | None = None):
     """为帖子定位(离线街区匹配 + 可选联网解析门牌地址)。"""
-    gc = geo.Geocoder() if online_geocode else None
+    gc = geo.get_geocoder() if online_geocode else None
     need_net = [it for it in items if gc and geo._address_queries(
         (it.address if it.category == "rent" else it.location) or "")]
     if need_net:
@@ -504,12 +534,46 @@ class Criteria:
     nature: str = ""                                    # 工作性质包含 (全职/兼职...)
     position: str = ""                                  # 职位包含
     exclude_ads: bool = False                           # 排除商家广告
+    exclude_taken: bool = False                         # 排除标题注明已租 / 已招满的帖子
     max_distance: float | None = None                   # 距家最大距离 km (需先设置家庭住址)
     sort_distance: bool = False                         # 按距离由近到远排序
 
 
+TAKEN_RE = re.compile(r"已租|已出租|已经租出|租出去了|已招到|已招满|招满|已满员|已找到|已结束|已转让")
+
+
 def _contains(hay: str, needle: str) -> bool:
     return needle.strip().lower() in (hay or "").lower()
+
+
+def _distance_key(x):
+    # 位置可靠的(地址/街道/街区)在前, 只知大区的估算排在后面, 无法定位的最后
+    return (x.distance is None, x.loc_level == "区域", x.distance if x.distance is not None else 0)
+
+
+def sort_listings(items, key: str, reverse: bool = False) -> list:
+    """按列排序; 空值永远排在最后。distance 列按可靠程度分组。"""
+    if key == "distance":
+        known = [x for x in items if x.distance is not None]
+        known.sort(key=lambda x: (x.loc_level == "区域", -x.distance if reverse else x.distance))
+        return known + [x for x in items if x.distance is None]
+    vals = [(getattr(x, key, None), x) for x in items]
+    present = [(v, x) for v, x in vals if v not in (None, "")]
+    missing = [x for v, x in vals if v in (None, "")]
+    present.sort(key=lambda p: p[0] if isinstance(p[0], (int, float)) else str(p[0]), reverse=reverse)
+    return [x for _, x in present] + missing
+
+
+def format_distance(it) -> str:
+    """表格中的距离: 地址/街道 1 位小数; 街区 <1 km 显示 '<1'; 只知大区显示 '≈整数'。"""
+    d = it.distance
+    if d is None:
+        return ""
+    if it.loc_level == "区域":
+        return f"≈{max(1, int(d + 0.5))}"   # 四舍五入 (round 是银行家舍入, 4.5 会变 4)
+    if it.loc_level == "街区" and d < 1:
+        return "<1"
+    return f"{d:.1f}"
 
 
 def apply_filters(items: list[Listing], c: Criteria) -> list[Listing]:
@@ -518,6 +582,8 @@ def apply_filters(items: list[Listing], c: Criteria) -> list[Listing]:
         if c.regions and it.region not in c.regions:
             continue
         if c.exclude_ads and it.region == "商家广告":
+            continue
+        if c.exclude_taken and TAKEN_RE.search(it.title or ""):
             continue
         if c.sorts and it.sort not in c.sorts:
             continue
@@ -554,9 +620,7 @@ def apply_filters(items: list[Listing], c: Criteria) -> list[Listing]:
             continue
         out.append(it)
     if c.sort_distance:
-        # 位置可靠的(地址/街道/街区)在前, 只知大区的估算排在后面, 无法定位的最后
-        out.sort(key=lambda x: (x.distance is None, x.loc_level == "区域",
-                                x.distance if x.distance is not None else 0))
+        out.sort(key=_distance_key)
     return out
 
 
@@ -676,14 +740,14 @@ def run_cli(argv=None):
     if a.here:
         try:
             lat, lon, acc = geo.locate_device()
-            addr = geo.Geocoder().reverse(lat, lon)
+            addr = "" if a.no_geocode else geo.get_geocoder().reverse(lat, lon)
             home = (lat, lon, f"当前位置 (精度约 ±{acc} m): {addr or f'{lat:.5f}, {lon:.5f}'}")
             cfg.update(home_text=addr or f"{lat:.5f}, {lon:.5f}", home_lat=lat, home_lon=lon, home_desc=home[2])
             geo.save_config(cfg)
         except geo.LocateError as e:
             print(f"一键定位失败: {e}")
     elif a.home:
-        home = geo.resolve_home(a.home, None if a.no_geocode else geo.Geocoder())
+        home = geo.resolve_home(a.home, None if a.no_geocode else geo.get_geocoder())
         if home:
             cfg.update(home_text=a.home, home_lat=home[0], home_lon=home[1], home_desc=home[2])
             geo.save_config(cfg)
@@ -721,586 +785,10 @@ def run_cli(argv=None):
 
 # ---------------------------------------------------------------- 图形界面 ----
 
-def enable_dpi_awareness() -> bool:
-    """声明进程支持高 DPI (Windows)。否则在 125%/150% 缩放下系统会把窗口位图拉伸, 文字发虚。"""
-    try:
-        import ctypes
-        try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)   # PROCESS_SYSTEM_DPI_AWARE
-        except (AttributeError, OSError):
-            ctypes.windll.user32.SetProcessDPIAware()
-        return True
-    except (AttributeError, OSError):
-        return False
-
-
 def run_gui():
-    import tkinter as tk
-    from tkinter import ttk, messagebox, filedialog
-
-    import tkinter.font as tkfont
-
-    enable_dpi_awareness()          # 必须在创建窗口之前: 高分屏下文字清晰, 不被拉伸
-    root = tk.Tk()
-    root.title(f"天维网 租房 / 招聘 信息抓取工具 v{__version__}")
-    ui = root.winfo_fpixels("1i") / 96.0          # 屏幕缩放比例 (100% = 1.0, 150% = 1.5)
-    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-    W, H = min(int(1280 * ui), int(sw * 0.94)), min(int(800 * ui), int(sh * 0.86))
-    root.geometry(f"{W}x{H}+{max(0, (sw - W) // 2)}+{max(0, (sh - H) // 3)}")
-    root.minsize(int(760 * ui), int(420 * ui))
-    style = ttk.Style()
-    if "vista" in style.theme_names():
-        style.theme_use("vista")
-    line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
-    style.configure("Treeview", rowheight=int(line * 1.45))
-
-    log_path = setup_logging()
-
-    def on_callback_error(exc_type, exc, tb):
-        log.error("界面操作出错", exc_info=(exc_type, exc, tb))
-        messagebox.showerror("程序出错", f"{exc_type.__name__}: {exc}\n\n详细信息已写入日志:\n{log_path}")
-    root.report_callback_exception = on_callback_error
-
-    state = {"items": {"rent": [], "job": []}, "shown": [], "running": False, "stop": None, "home": None}
-    msgq: queue.Queue = queue.Queue()
-    cfg = geo.load_config()
-    if cfg.get("home_lat") is not None:
-        state["home"] = (cfg["home_lat"], cfg["home_lon"], cfg.get("home_desc", ""))
-
-    cat_var = tk.StringVar(value="rent")
-    days_var = tk.IntVar(value=10)
-    detail_var = tk.BooleanVar(value=True)
-
-    # ---- 顶部: 抓取 ----
-    top = ttk.Frame(root, padding=8)
-    top.pack(fill="x")
-    ttk.Label(top, text="类别:").pack(side="left")
-    for k in ("rent", "job"):
-        ttk.Radiobutton(top, text=CATEGORIES[k]["name"], value=k, variable=cat_var,
-                        command=lambda: on_cat_change()).pack(side="left", padx=4)
-    ttk.Label(top, text="   最近天数:").pack(side="left")
-    ttk.Spinbox(top, from_=1, to=60, width=5, textvariable=days_var).pack(side="left")
-    ttk.Checkbutton(top, text="读取帖子详情(租金/薪金等)", variable=detail_var).pack(side="left", padx=10)
-    btn_fetch = ttk.Button(top, text="开始抓取", command=lambda: start_fetch())
-    btn_fetch.pack(side="left", padx=4)
-    btn_stop = ttk.Button(top, text="停止", state="disabled", command=lambda: stop_fetch())
-    btn_stop.pack(side="left", padx=4)
-    pbar = ttk.Progressbar(top, length=220, mode="determinate")
-    pbar.pack(side="left", padx=10)
-    status = tk.StringVar(value="就绪")
-    ttk.Label(top, textvariable=status, foreground="#555").pack(side="left", padx=6)
-
-    # ---- 筛选区 ----
-    fbox = ttk.LabelFrame(root, text="筛选条件 (抓取后可随时调整,点「应用筛选」)", padding=8)
-    fbox.pack(fill="x", padx=8)
-
-    type_frame = ttk.Frame(fbox)
-    type_frame.grid(row=0, column=0, columnspan=12, sticky="w")
-    type_vars: dict[str, tk.BooleanVar] = {}
-    sort_vars: dict[str, tk.BooleanVar] = {}
-
-    min_var, max_var = tk.StringVar(), tk.StringVar()
-    keep_np_var = tk.BooleanVar(value=True)
-    kw_var, ex_var, addr_var = tk.StringVar(), tk.StringVar(), tk.StringVar()
-    rt_var, ht_var = tk.StringVar(), tk.StringVar()
-    nature_var, pos_var = tk.StringVar(value="全部"), tk.StringVar()
-    type_label_var = tk.StringVar(value="全部")
-    noads_var = tk.BooleanVar(value=False)
-
-    row2 = ttk.Frame(fbox)
-    row2.grid(row=1, column=0, columnspan=12, sticky="w", pady=(6, 0))
-    price_label = ttk.Label(row2, text="周租金 NZD:")
-    price_label.pack(side="left")
-    ttk.Entry(row2, width=7, textvariable=min_var).pack(side="left")
-    ttk.Label(row2, text="~").pack(side="left")
-    ttk.Entry(row2, width=7, textvariable=max_var).pack(side="left")
-    ttk.Checkbutton(row2, text="保留无价格帖", variable=keep_np_var).pack(side="left", padx=6)
-    addr_label = ttk.Label(row2, text="  地址包含:")
-    addr_label.pack(side="left")
-    ttk.Entry(row2, width=14, textvariable=addr_var).pack(side="left")
-    ttk.Label(row2, text="  关键词(空格分隔,全部包含):").pack(side="left")
-    ttk.Entry(row2, width=18, textvariable=kw_var).pack(side="left")
-    ttk.Label(row2, text="  排除词:").pack(side="left")
-    ttk.Entry(row2, width=12, textvariable=ex_var).pack(side="left")
-
-    row3 = ttk.Frame(fbox)
-    row3.grid(row=2, column=0, columnspan=12, sticky="w", pady=(6, 0))
-    rent_opts = ttk.Frame(row3)
-    ttk.Label(rent_opts, text="出租类型包含:").pack(side="left")
-    ttk.Combobox(rent_opts, width=10, textvariable=rt_var,
-                 values=["", "整租", "分租", "单间", "Flatmates", "短租"]).pack(side="left")
-    ttk.Label(rent_opts, text="  房屋类型包含:").pack(side="left")
-    ttk.Combobox(rent_opts, width=10, textvariable=ht_var,
-                 values=["", "独立屋", "公寓", "单元房", "Townhouse", "Unit"]).pack(side="left")
-    job_opts = ttk.Frame(row3)
-    ttk.Label(job_opts, text="职位包含:").pack(side="left")
-    ttk.Entry(job_opts, width=14, textvariable=pos_var).pack(side="left")
-    ttk.Checkbutton(row3, text="排除商家广告", variable=noads_var).pack(side="right", padx=10)
-    ttk.Button(row3, text="应用筛选", command=lambda: refresh_table()).pack(side="right", padx=4)
-    ttk.Button(row3, text="重置筛选", command=lambda: reset_filters()).pack(side="right", padx=4)
-
-    # ---- 家庭住址 / 距离 (租房和招聘通用) ----
-    hbox = ttk.LabelFrame(root, text="家庭住址 / 距离 (租房和招聘通用)", padding=8)
-    hbox.pack(fill="x", padx=8, pady=(6, 0))
-    home_var = tk.StringVar(value=cfg.get("home_text", ""))
-    maxdist_var = tk.StringVar(value=cfg.get("max_distance", ""))
-    sortdist_var = tk.BooleanVar(value=bool(cfg.get("sort_distance", True)))
-    online_var = tk.BooleanVar(value=bool(cfg.get("online_geocode", True)))
-    btn_here = ttk.Button(hbox, text="📍 一键定位当前位置", command=lambda: locate_here())
-    btn_here.pack(side="left", padx=(0, 10))
-    ttk.Label(hbox, text="或输入地址:").pack(side="left")
-    home_entry = ttk.Entry(hbox, width=34, textvariable=home_var)
-    home_entry.pack(side="left")
-    btn_home = ttk.Button(hbox, text="按地址定位", command=lambda: locate_home())
-    btn_home.pack(side="left", padx=4)
-    ttk.Label(hbox, text="  最大距离 km:").pack(side="left")
-    ttk.Entry(hbox, width=6, textvariable=maxdist_var).pack(side="left")
-    ttk.Checkbutton(hbox, text="按距离排序(近→远)", variable=sortdist_var,
-                    command=lambda: (save_prefs(), refresh_table())).pack(side="left", padx=8)
-    ttk.Checkbutton(hbox, text="联网解析帖子门牌地址(更准)", variable=online_var,
-                    command=lambda: on_online_toggle()).pack(side="left")
-    home_status = tk.StringVar()
-    ttk.Label(root, textvariable=home_status, foreground="#2E6E2E", padding=(16, 2)).pack(fill="x")
-
-    # ---- 结果表 ----
-    mid = ttk.Frame(root, padding=(8, 6))
-    mid.pack(fill="both", expand=True)
-    tree = ttk.Treeview(mid, show="headings", selectmode="extended")
-    vsb = ttk.Scrollbar(mid, orient="vertical", command=tree.yview)
-    hsb = ttk.Scrollbar(mid, orient="horizontal", command=tree.xview)
-    tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-    tree.grid(row=0, column=0, sticky="nsew")
-    vsb.grid(row=0, column=1, sticky="ns")
-    hsb.grid(row=1, column=0, sticky="ew")
-    mid.rowconfigure(0, weight=1)
-    mid.columnconfigure(0, weight=1)
-
-    # 底栏和详情区先于结果表分配空间 (side=bottom, before=mid): 窗口变矮时只压缩结果表,
-    # 导出按钮始终可见
-    bottom = ttk.Frame(root, padding=8)
-    bottom.pack(side="bottom", fill="x", before=mid)
-    detail = tk.Text(root, height=6, wrap="word")
-    detail.pack(side="bottom", fill="x", padx=8, before=mid)
-    count_var = tk.StringVar(value="")
-    ttk.Label(bottom, textvariable=count_var).pack(side="left")
-    ttk.Button(bottom, text="导出 Excel (当前筛选结果)", command=lambda: do_export()).pack(side="right")
-    ttk.Label(bottom, text="双击行在浏览器打开帖子;点击表头排序   ", foreground="#777").pack(side="right")
-
-    # ---- 逻辑 ----
-    def cell(it, k):
-        v = getattr(it, k, "")
-        if v is None:
-            return ""
-        if k == "distance" and it.loc_level == "区域":
-            return f"≈{v:g}"          # 只知大区, 距离为粗略估算
-        if isinstance(v, float):
-            return f"{v:g}"
-        return v
-
-    def fill_tree(rows):
-        tree.delete(*tree.get_children())
-        keys = [k for k, _, _ in view_cols()]
-        for it in rows:
-            tags = ("coarse",) if it.loc_level in ("区域", "") else ()
-            tree.insert("", "end", iid=str(it.tid), values=[cell(it, k) for k in keys], tags=tags)
-
-    def show_home_status():
-        h = state["home"]
-        if h:
-            home_status.set(f"✔ 住址已定位: {h[2][:90]}  ({h[0]:.5f}, {h[1]:.5f})   "
-                            f"—— 预估距离为直线距离, 定位依据: 地址 > 街区 > 区域中心")
-        else:
-            home_status.set("未设置家庭住址: 在家时点「📍 一键定位当前位置」即可; 也可输入街道地址 "
-                            "(如 1 Ti Rakau Drive, Pakuranga)、街区名或 '纬度,经度' 后点「按地址定位」")
-
-    def save_prefs():
-        c = geo.load_config()
-        c.update(home_text=home_var.get().strip(), max_distance=maxdist_var.get().strip(),
-                 sort_distance=sortdist_var.get(), online_geocode=online_var.get())
-        if state["home"]:
-            c.update(home_lat=state["home"][0], home_lon=state["home"][1], home_desc=state["home"][2])
-        else:
-            for k in ("home_lat", "home_lon", "home_desc"):
-                c.pop(k, None)
-        try:
-            geo.save_config(c)
-        except OSError:
-            pass
-
-    def locate_home():
-        text = home_var.get().strip()
-        if not text:
-            state["home"] = None
-            save_prefs()
-            show_home_status()
-            refresh_table()
-            return
-        btn_home.config(state="disabled")
-        home_status.set("正在定位住址 ...")
-        use_net = online_var.get()
-
-        def work():
-            try:
-                r = geo.resolve_home(text, geo.Geocoder() if use_net else None)
-            except Exception:  # noqa: BLE001
-                r = None
-            msgq.put(("home", r))
-        threading.Thread(target=work, daemon=True).start()
-
-    home_entry.bind("<Return>", lambda e: locate_home())
-
-    def locate_here():
-        btn_here.config(state="disabled")
-        btn_home.config(state="disabled")
-        home_status.set("正在通过 Windows 定位服务获取当前位置 (约 5-15 秒) ...")
-
-        def work():
-            try:
-                lat, lon, acc = geo.locate_device()
-            except geo.LocateError as e:
-                msgq.put(("here_err", str(e)))
-                return
-            except Exception as e:  # noqa: BLE001
-                msgq.put(("here_err", f"定位失败: {e}"))
-                return
-            try:
-                addr = geo.Geocoder().reverse(lat, lon)
-            except Exception:  # noqa: BLE001
-                addr = ""
-            msgq.put(("here", (lat, lon, acc, addr)))
-        threading.Thread(target=work, daemon=True).start()
-
-    def on_online_toggle():
-        save_prefs()
-        if online_var.get() and not state["running"] and any(state["items"].values()):
-            status.set("联网解析已抓取帖子的门牌地址 ...")
-            items_all = state["items"]["rent"] + state["items"]["job"]
-
-            def work():
-                locate_items(items_all, True, log=lambda m: msgq.put(("log", m)))
-                msgq.put(("relocated", None))
-            threading.Thread(target=work, daemon=True).start()
-
-    def view_cols():
-        cols = [c for c in columns_for(cat_var.get()) if c[0] not in ("content", "url", "facilities", "wechat")]
-        return cols
-
-    def setup_columns():
-        cols = view_cols()
-        tree["columns"] = [k for k, _, _ in cols]
-        for k, h, w in cols:
-            tree.heading(k, text=h, command=lambda kk=k: sort_by(kk))
-            tree.column(k, width=int(w * 8 * ui), minwidth=int(40 * ui), stretch=(k == "title"))
-
-    def build_type_checks():
-        for w in type_frame.winfo_children():
-            w.destroy()
-        type_vars.clear()
-        sort_vars.clear()
-        cfg = CATEGORIES[cat_var.get()]
-        ttk.Label(type_frame, text=cfg["type_label"] + ":").pack(side="left")
-        if cat_var.get() == "rent":
-            for name in cfg["typeids"].values():
-                v = tk.BooleanVar(value=False)
-                type_vars[name] = v
-                ttk.Checkbutton(type_frame, text=name, variable=v).pack(side="left", padx=2)
-        else:
-            mb = ttk.Menubutton(type_frame, textvariable=type_label_var, width=26)
-            menu = tk.Menu(mb, tearoff=0)
-
-            def clear_types():
-                for x in type_vars.values():
-                    x.set(False)
-                update_type_label()
-                refresh_table()
-            menu.add_command(label="全部 (清除选择)", command=clear_types)
-            menu.add_separator()
-            for name in cfg["typeids"].values():
-                v = tk.BooleanVar(value=False)
-                type_vars[name] = v
-                menu.add_checkbutton(label=name, variable=v,
-                                     command=lambda: (update_type_label(), refresh_table()))
-            mb["menu"] = menu
-            mb.pack(side="left", padx=2)
-            update_type_label()
-            ttk.Label(type_frame, text="   工作性质:").pack(side="left")
-            cb = ttk.Combobox(type_frame, width=6, textvariable=nature_var, state="readonly",
-                              values=["全部", "全职", "兼职"])
-            cb.pack(side="left")
-            cb.bind("<<ComboboxSelected>>", lambda e: refresh_table())
-        ttk.Label(type_frame, text="    类型:").pack(side="left")
-        for name in cfg["sortids"].values():
-            v = tk.BooleanVar(value=False)
-            sort_vars[name] = v
-            ttk.Checkbutton(type_frame, text=name, variable=v).pack(side="left", padx=2)
-        ttk.Label(type_frame, text="  (不勾选=全部)", foreground="#777").pack(side="left")
-
-    def update_type_label():
-        sel = [k for k, v in type_vars.items() if v.get()]
-        type_label_var.set("全部" if not sel else (", ".join(sel) if len(sel) <= 2 else f"已选 {len(sel)} 类: "
-                                                   + ", ".join(sel[:2]) + " ..."))
-
-    def on_cat_change():
-        build_type_checks()
-        if cat_var.get() == "rent":
-            job_opts.pack_forget()
-            rent_opts.pack(side="left")
-            price_label.config(text="周租金 NZD:")
-            addr_label.config(text="  地址包含:")
-        else:
-            rent_opts.pack_forget()
-            job_opts.pack(side="left")
-            price_label.config(text="时薪 NZD:")
-            addr_label.config(text="  工作地点包含:")
-        setup_columns()
-        refresh_table()
-
-    def _num(s):
-        s = s.strip()
-        if not s:
-            return None
-        try:
-            return float(s)
-        except ValueError:
-            return None
-
-    def current_criteria() -> Criteria:
-        rent = cat_var.get() == "rent"
-        return Criteria(
-            regions=[k for k, v in type_vars.items() if v.get()],
-            sorts=[k for k, v in sort_vars.items() if v.get()],
-            min_price=_num(min_var.get()), max_price=_num(max_var.get()),
-            keep_no_price=keep_np_var.get(),
-            keywords=kw_var.get().split(), exclude=ex_var.get().split(),
-            address=addr_var.get().strip(),
-            rent_type=rt_var.get().strip() if rent else "",
-            house_type=ht_var.get().strip() if rent else "",
-            nature="" if rent or nature_var.get() in ("", "全部") else nature_var.get(),
-            position=pos_var.get().strip() if not rent else "",
-            exclude_ads=noads_var.get(),
-            max_distance=_num(maxdist_var.get()) if state["home"] else None,
-            sort_distance=sortdist_var.get() and bool(state["home"]))
-
-    def reset_filters():
-        for v in list(type_vars.values()) + list(sort_vars.values()):
-            v.set(False)
-        for v in (min_var, max_var, kw_var, ex_var, addr_var, rt_var, ht_var, pos_var):
-            v.set("")
-        nature_var.set("全部")
-        update_type_label()
-        keep_np_var.set(True)
-        noads_var.set(False)
-        refresh_table()
-
-    def refresh_table():
-        cat = cat_var.get()
-        items = state["items"][cat]
-        geo.compute_distances(items, state["home"])
-        shown = apply_filters(items, current_criteria())
-        state["shown"] = shown
-        fill_tree(shown)
-        extra = ""
-        if state["home"] and items:
-            n = sum(1 for it in shown if it.distance is not None)
-            extra = f"  (其中 {n} 条有预估距离)"
-        count_var.set(f"{CATEGORIES[cat]['name']}: 共抓取 {len(items)} 条,筛选后 {len(shown)} 条{extra}")
-
-    sort_state = {"key": None, "rev": False}
-
-    def sort_by(key):
-        rev = not sort_state["rev"] if sort_state["key"] == key else False
-        sort_state.update(key=key, rev=rev)
-
-        def kf(it):
-            v = getattr(it, key, "")
-            if isinstance(v, (int, float)) or v is None:
-                return (0, v if v is not None else float("-inf"))
-            return (1, str(v))
-        if key == "distance":   # 无距离的始终排在最后
-            state["shown"].sort(key=lambda x: (x.distance is None, x.loc_level == "区域",
-                                               (x.distance or 0) * (-1 if rev else 1)))
-        else:
-            state["shown"].sort(key=kf, reverse=rev)
-        fill_tree(state["shown"])
-
-    def find_item(tid):
-        for it in state["items"][cat_var.get()]:
-            if str(it.tid) == tid:
-                return it
-        return None
-
-    def on_select(_e=None):
-        sel = tree.selection()
-        if not sel:
-            return
-        it = find_item(sel[0])
-        if not it:
-            return
-        detail.delete("1.0", "end")
-        lines = [it.title, it.url]
-        dist = f"{it.distance:g} km (直线)" if it.distance is not None else ("-" if state["home"] else "未设置家庭住址")
-        lines.append(f"预估距离: {dist}   定位依据: {it.loc_desc}")
-        if it.category == "rent":
-            lines.append(f"租金: {it.price_text or '-'}  出租类型: {it.rent_type}  房屋类型: {it.house_type}  "
-                         f"地址: {it.address}  电话: {it.phone}  微信: {it.wechat}")
-            if it.facilities:
-                lines.append(f"设施: {it.facilities}")
-        else:
-            lines.append(f"公司: {it.company}  职位: {it.position}  薪金: {it.salary}  性质: {it.nature}  "
-                         f"地点: {it.location}  时间: {it.work_time}  电话: {it.phone}  微信: {it.wechat}  邮箱: {it.email}")
-        for k, v in it.extra.items():
-            lines.append(f"{k}: {v}")
-        lines.append(it.content)
-        detail.insert("1.0", "\n".join(lines))
-
-    def on_double(_e=None):
-        sel = tree.selection()
-        if sel:
-            it = find_item(sel[0])
-            if it:
-                webbrowser.open(it.url)
-
-    tree.tag_configure("coarse", foreground="#8A8A8A")   # 只能定位到大区 / 无法定位的行显示为灰色
-    tree.bind("<<TreeviewSelect>>", on_select)
-    tree.bind("<Double-1>", on_double)
-
-    def do_export():
-        cat = cat_var.get()
-        if not state["shown"]:
-            messagebox.showinfo("提示", "当前没有可导出的数据")
-            return
-        path = filedialog.asksaveasfilename(defaultextension=".xlsx", initialfile=default_filename(cat),
-                                            filetypes=[("Excel 文件", "*.xlsx")])
-        if not path:
-            return
-        try:
-            export_excel(state["shown"], cat, path)
-        except PermissionError:
-            messagebox.showerror("导出失败", "文件被占用,请先关闭 Excel 中已打开的同名文件")
-            return
-        except Exception as e:  # noqa: BLE001
-            log.exception("导出 Excel 失败: %s", path)
-            messagebox.showerror("导出失败", f"{type(e).__name__}: {e}\n\n详细信息已写入日志:\n{log_path}")
-            return
-        if messagebox.askyesno("导出完成", f"已导出 {len(state['shown'])} 条到\n{path}\n\n是否立即打开?"):
-            try:
-                os.startfile(path)  # type: ignore[attr-defined]
-            except Exception:  # noqa: BLE001
-                pass
-
-    def start_fetch():
-        if state["running"]:
-            return
-        try:
-            days = int(days_var.get())
-        except (tk.TclError, ValueError):
-            days = 10
-        cat = cat_var.get()
-        stop = threading.Event()
-        state.update(running=True, stop=stop)
-        btn_fetch.config(state="disabled")
-        btn_stop.config(state="normal")
-        pbar.config(mode="indeterminate", value=0)
-        pbar.start(12)
-
-        def worker():
-            sc = Scraper(log=lambda m: msgq.put(("log", m)), stop_event=stop)
-            try:
-                items = sc.scrape(cat, days, with_detail=detail_var.get(),
-                                  progress=lambda d, t: msgq.put(("prog", (d, t))),
-                                  online_geocode=online_var.get())
-                msgq.put(("done", (cat, items)))
-            except InterruptedError:
-                msgq.put(("done", (cat, [])))
-            except Exception as e:  # noqa: BLE001
-                msgq.put(("error", str(e)))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def stop_fetch():
-        if state["stop"]:
-            state["stop"].set()
-            status.set("正在停止 ...")
-
-    def poll():
-        try:
-            while True:
-                kind, data = msgq.get_nowait()
-                if kind == "log":
-                    status.set(data)
-                elif kind == "prog":
-                    d, t = data
-                    if t:
-                        if str(pbar["mode"]) != "determinate":
-                            pbar.stop()
-                            pbar.config(mode="determinate")
-                        pbar.config(maximum=t, value=d)
-                        status.set(f"处理中 {d}/{t}")
-                elif kind == "here":
-                    btn_here.config(state="normal")
-                    btn_home.config(state="normal")
-                    lat, lon, acc, addr = data
-                    note = f"当前位置 (精度约 ±{acc} m)"
-                    if acc > 2000:
-                        note += " ⚠ 精度较低, 建议连接 Wi-Fi 后重试或手动输入地址"
-                    if not (-47.6 <= lat <= -34.0 and 166.0 <= lon <= 179.0):
-                        note += " ⚠ 当前位置不在新西兰"
-                    state["home"] = (lat, lon, f"{note}: {addr or f'{lat:.5f}, {lon:.5f}'}")
-                    home_var.set(addr or f"{lat:.5f}, {lon:.5f}")
-                    save_prefs()
-                    show_home_status()
-                    refresh_table()
-                elif kind == "here_err":
-                    btn_here.config(state="normal")
-                    btn_home.config(state="normal")
-                    show_home_status()
-                    messagebox.showwarning("一键定位失败", data)
-                elif kind == "home":
-                    btn_here.config(state="normal")
-                    btn_home.config(state="normal")
-                    if data:
-                        state["home"] = data
-                    else:
-                        messagebox.showwarning("定位失败", "无法解析该住址。\n可以试试: 更完整的街道地址、街区名 "
-                                               "(如 Mount Albert), 或直接输入 '纬度,经度'")
-                    save_prefs()
-                    show_home_status()
-                    refresh_table()
-                elif kind == "relocated":
-                    status.set("帖子位置已更新")
-                    refresh_table()
-                elif kind in ("done", "error"):
-                    pbar.stop()
-                    pbar.config(mode="determinate", value=0)
-                    state["running"] = False
-                    btn_fetch.config(state="normal")
-                    btn_stop.config(state="disabled")
-                    if kind == "error":
-                        status.set("出错")
-                        messagebox.showerror("抓取失败", data)
-                    else:
-                        cat, items = data
-                        if items:
-                            state["items"][cat] = items
-                        status.set(f"完成,抓取 {len(items)} 条")
-                        if cat == cat_var.get():
-                            refresh_table()
-        except queue.Empty:
-            pass
-        state["poll_id"] = root.after(150, poll)
-
-    def on_destroy(e):
-        if e.widget is root and state.get("poll_id"):
-            root.after_cancel(state["poll_id"])   # 关窗后不再触发轮询
-    root.bind("<Destroy>", on_destroy, add="+")
-
-    show_home_status()
-    on_cat_change()
-    poll()
-    root.mainloop()
-
-
-log = logging.getLogger("skykiwi")
+    """图形界面见 gui.py; 把本模块传过去, 避免以脚本运行时被重复导入。"""
+    import gui
+    gui.run(sys.modules[__name__])
 
 
 def setup_logging() -> str:
@@ -1323,6 +811,64 @@ def setup_logging() -> str:
     return path
 
 
+def is_cli(argv) -> bool:
+    """有以 - 开头的参数才进命令行模式 (拖文件到 exe 上仍打开图形界面)。"""
+    return any(a.startswith("-") for a in argv[1:])
+
+
+def _parent_pid(pid: int) -> int | None:
+    """用 Toolhelp 快照查进程的父进程 ID (Windows); 找不到返回 None。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return None
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_void_p),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+    k32 = ctypes.windll.kernel32
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    snap = k32.CreateToolhelp32Snapshot(0x2, 0)          # TH32CS_SNAPPROCESS
+    if not snap or snap == wintypes.HANDLE(-1).value:
+        return None
+    try:
+        e = PROCESSENTRY32W()
+        e.dwSize = ctypes.sizeof(e)
+        ok = k32.Process32FirstW(snap, ctypes.byref(e))
+        while ok:
+            if e.th32ProcessID == pid:
+                return e.th32ParentProcessID
+            ok = k32.Process32NextW(snap, ctypes.byref(e))
+        return None
+    finally:
+        k32.CloseHandle(snap)
+
+
+def attach_parent_console():
+    """--windowed 打包的 exe 没有控制台: 命令行模式下挂到启动它的 cmd / PowerShell 窗口, 让输出可见。"""
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        # onefile exe 有两层进程: cmd -> 引导进程(无控制台) -> 本进程, 所以先试祖父进程
+        grand = _parent_pid(os.getppid())
+        if not ((grand and k32.AttachConsole(grand)) or k32.AttachConsole(-1)):
+            log.info("命令行模式: 没有可连接的控制台, 输出不可见 (请在 cmd 中用 start /wait 运行)")
+            return
+        enc = f"cp{ctypes.windll.kernel32.GetConsoleOutputCP()}"
+        sys.stdout = open("CONOUT$", "w", encoding=enc, errors="replace", buffering=1)
+        sys.stderr = open("CONOUT$", "w", encoding=enc, errors="replace", buffering=1)
+        print()
+        log.info("命令行模式: 已连接父控制台 (代码页 %s)", enc)
+    except (AttributeError, OSError, LookupError):
+        pass
+
+
 def main():
     # 打包成 --windowed exe 时没有控制台, stdout/stderr 为 None, 防止 print 报错
     for name in ("stdout", "stderr"):
@@ -1335,7 +881,8 @@ def main():
                 pass
     setup_logging()
     log.info("启动 v%s %s", __version__, " ".join(sys.argv[1:]))
-    if len(sys.argv) > 1:
+    if is_cli(sys.argv):
+        attach_parent_console()
         run_cli()
     else:
         run_gui()

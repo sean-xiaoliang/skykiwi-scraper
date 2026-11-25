@@ -91,8 +91,9 @@ def test_export_failure_shows_error():
     try:
         def check(root):
             # 放入一条数据, 让导出有内容
-            k.Scraper.scrape = lambda self, cat, days=10, **kw: [k.Listing(tid=1, category=cat, title="t")]
-            find(root, ttk.Button, "开始抓取").invoke()
+            k.Scraper.scrape = lambda self, cat, days=10, **kw: [
+                k.Listing(tid=1, category=cat, title="t", sort="出租" if cat == "rent" else "招聘")]
+            find(root, ttk.Button, "抓取").invoke()
             for _ in range(40):
                 root.update()
                 root.after(50)
@@ -125,6 +126,135 @@ def test_callback_exception_logged():
     with open(log, encoding="utf-8") as f:
         assert "回调里的意外错误" in f.read()
     assert shown, "没有提示用户"
+
+
+# ==================== v1.1.0 ====================
+
+def pump(root, ms=500):
+    """运行事件循环 ms 毫秒 (等待防抖等延迟任务)。"""
+    import time
+    end = time.time() + ms / 1000
+    while time.time() < end:
+        root.update()
+        time.sleep(0.02)
+
+
+def rent_items():
+    a = k.Listing(tid=1, category="rent", title="Albany 双人房", sort="出租", region="北岸", price=300.0)
+    b = k.Listing(tid=2, category="rent", title="Howick 单间", sort="出租", region="东区", price=200.0)
+    c = k.Listing(tid=3, category="rent", title="求租 CBD", sort="求租", region="市中心", price=250.0)
+    d = k.Listing(tid=4, category="rent", title="已租", sort="出租", region="东区", price=220.0)
+    return [a, b, c, d]
+
+
+def rows(tab):
+    return [int(i) for i in tab.tree.get_children()]
+
+
+def test_tabs_keep_separate_filters():
+    def check(root):
+        app = root.app
+        app.tabs["rent"].min_var.set("200")
+        app.notebook.select(app.tabs["job"].frame)
+        pump(root, 100)
+        assert app.tabs["job"].min_var.get() == "", "招聘页沿用了租房页的价格条件"
+        assert app.tabs["rent"].min_var.get() == "200"
+    with_gui(check)
+
+
+def test_filters_apply_immediately_without_button():
+    def check(root):
+        assert not [w for w in walk(root) if isinstance(w, ttk.Button) and "应用筛选" in str(w.cget("text"))]
+        tab = root.app.tabs["rent"]
+        tab.set_items(rent_items())
+        tab.kw_var.set("Howick")
+        pump(root, 600)
+        assert rows(tab) == [2], rows(tab)
+    with_gui(check)
+
+
+def test_defaults_rental_only_and_exclude_taken():
+    def check(root):
+        tab = root.app.tabs["rent"]
+        tab.set_items(rent_items())
+        pump(root, 100)
+        assert sorted(rows(tab)) == [1, 2], rows(tab)     # 不含求租, 不含"已租"
+        assert root.app.tabs["job"].sort_vars["招聘"].get() is True
+    with_gui(check)
+
+
+def test_invalid_number_marked():
+    def check(root):
+        tab = root.app.tabs["rent"]
+        tab.min_var.set("abc")
+        pump(root, 600)
+        assert tab.min_entry.cget("style") == "Bad.TEntry", tab.min_entry.cget("style")
+        tab.min_var.set("150")
+        pump(root, 600)
+        assert tab.min_entry.cget("style") != "Bad.TEntry"
+    with_gui(check)
+
+
+def test_job_key_columns_visible():
+    def check(root):
+        app = root.app
+        app.notebook.select(app.tabs["job"].frame)
+        tab = app.tabs["job"]
+        tab.set_items([k.Listing(tid=1, category="job", title="招聘厨房帮工", sort="招聘", nature="兼职")])
+        pump(root, 200)
+        cols = list(tab.tree["columns"])
+        assert "nature" in cols and "salary_num" in cols, cols
+        x = 0
+        for c in cols:
+            w = tab.tree.column(c, "width")
+            if c in ("nature", "salary_num"):
+                assert x + w <= tab.tree.winfo_width() + 2, f"{c} 列在可视区域外"
+            x += w
+        assert tab.tree.column("title", "width") >= 180, tab.tree.column("title", "width")
+    with_gui(check)
+
+
+def test_multiselect_stays_open_while_choosing():
+    def check(root):
+        ms = root.app.tabs["rent"].type_select
+        ms.open()
+        pump(root, 100)
+        boxes = [w for w in walk(ms.popup) if isinstance(w, ttk.Checkbutton)]
+        boxes[1].invoke()
+        boxes[2].invoke()
+        pump(root, 100)
+        assert ms.popup is not None and ms.popup.winfo_exists(), "勾选一项后下拉框就关了"
+        assert len(ms.get()) == 2, ms.get()
+        ms.close()
+    with_gui(check)
+
+
+def test_sort_indicator_and_persistence():
+    def check(root):
+        tab = root.app.tabs["rent"]
+        root.app.sortdist_var.set(False)
+        tab.set_items(rent_items())
+        tab.sort_by("price")
+        pump(root, 100)
+        assert "▲" in tab.tree.heading("price", "text"), tab.tree.heading("price", "text")
+        assert rows(tab) == [2, 1], rows(tab)
+        tab.ex_var.set("不存在的词")   # 触发一次刷新, 不改变结果
+        pump(root, 600)
+        assert rows(tab) == [2, 1], "刷新后排序丢失"
+    with_gui(check)
+
+
+def test_detail_is_readonly():
+    def check(root):
+        assert str(root.app.tabs["rent"].detail.cget("state")) == "disabled"
+    with_gui(check)
+
+
+def test_keyboard_shortcuts_bound():
+    def check(root):
+        assert root.bind("<F5>"), "F5 未绑定"
+        assert root.bind("<Control-e>"), "Ctrl+E 未绑定"
+    with_gui(check)
 
 
 if __name__ == "__main__":

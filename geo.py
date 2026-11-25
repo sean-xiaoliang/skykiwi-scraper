@@ -98,6 +98,17 @@ STREET_WORDS = (r"street|st|road|rd|avenue|ave|drive|dr|place|pl|crescent|cres|t
                 r"highway|hwy|way|close|grove|parade|boulevard|blvd|court|ct|rise|view|esplanade")
 _STREET_AFTER = re.compile(r"^\s*(" + STREET_WORDS + r")(?![a-z])")
 _STREET_IN = re.compile(r"(?<![a-z])(" + STREET_WORDS + r")(?![a-z])")
+# 这些词也是普通英文 (close to / sea view / on the way): 后面还跟着英文单词时不算街道名
+_AMBIGUOUS_STREET = {"close", "view", "way", "rise", "grove", "court", "ct", "parade", "place", "pl"}
+
+
+def _is_street_suffix(after: str) -> bool:
+    m = _STREET_AFTER.match(after)
+    if not m:
+        return False
+    if m.group(1) in _AMBIGUOUS_STREET and re.match(r"\s+[a-z]", after[m.end():]):
+        return False
+    return True
 _TRAVEL_BEFORE = re.compile(r"(去|到|离|距|至|往|直达|通往|开车|驾车|步行|走路|坐车|搭车|车程|(?<![a-z])(to|from)\s*$)")
 _TRAVEL_AFTER = re.compile(r"^\s*(mall|商场|购物中心|校区)?\s*(只需|仅需|大概|大约|约|也就|才)?\s*\d+\s*(分钟|min)")
 _NEGATED = re.compile(r"(排除|除了|除去|不要|不考虑|不含|不包括|except|not\s)")
@@ -159,7 +170,7 @@ def find_places(text: str) -> list[Match]:
         before = t[max(0, s - 6):s]
         out.append(Match(
             pos=s, name=name, generic=key in GENERIC,
-            street=name not in ROAD_PLACES and bool(_STREET_AFTER.match(t[e:])),
+            street=name not in ROAD_PLACES and _is_street_suffix(t[e:]),
             travel=bool(_TRAVEL_BEFORE.search(before)) or bool(_TRAVEL_AFTER.match(t[e:e + 14])),
             negated=bool(_NEGATED.search(t[max(0, s - 8):s]))))
     return out
@@ -216,18 +227,41 @@ def in_auckland(lat, lon) -> bool:
 
 # ---------------------------------------------------------------- 配置 ----
 
-def load_config() -> dict:
+def _read_json(path: str) -> dict:
+    """读取 JSON; 文件损坏时改名为 .bad 备份 (而不是静默丢弃), 返回空字典。"""
     try:
-        with open(CONFIG_FILE, encoding="utf-8") as f:
-            return json.load(f)
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
     except (OSError, ValueError):
+        try:
+            os.replace(path, path + ".bad")
+        except OSError:
+            pass
         return {}
 
 
+def _write_json(path: str, data, **kw):
+    """原子写入: 先写临时文件再替换, 程序中途被关也不会留下写了一半的文件。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, **kw)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def load_config() -> dict:
+    return _read_json(CONFIG_FILE)
+
+
 def save_config(cfg: dict):
-    os.makedirs(APP_DIR, exist_ok=True)
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    _write_json(CONFIG_FILE, cfg, indent=2)
 
 
 # ---------------------------------------------------------------- 联网解析 ----
@@ -237,15 +271,11 @@ class Geocoder:
 
     def __init__(self, timeout: int = 15):
         self.timeout = timeout
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()   # save() 可能在 search() 持锁时调用
         self._last = 0.0
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": GEO_UA, "Accept-Language": "en"})
-        try:
-            with open(CACHE_FILE, encoding="utf-8") as f:
-                self.cache = json.load(f)
-        except (OSError, ValueError):
-            self.cache = {}
+        self.cache = _read_json(CACHE_FILE)
         self._dirty = 0
 
     def search(self, query: str) -> list[tuple]:
@@ -306,12 +336,25 @@ class Geocoder:
 
     def save(self):
         try:
-            os.makedirs(APP_DIR, exist_ok=True)
-            with open(CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.cache, f, ensure_ascii=False)
+            with self._lock:
+                snapshot = dict(self.cache)
+            _write_json(CACHE_FILE, snapshot)
             self._dirty = 0
         except OSError:
             pass
+
+
+_geocoder: Geocoder | None = None
+_geocoder_lock = threading.Lock()
+
+
+def get_geocoder() -> Geocoder:
+    """全进程共享一个 Geocoder: 限速 (每秒 1 次) 和缓存只有一份, 不会互相覆盖。"""
+    global _geocoder
+    with _geocoder_lock:
+        if _geocoder is None:
+            _geocoder = Geocoder()
+        return _geocoder
 
 
 class LocateError(Exception):
