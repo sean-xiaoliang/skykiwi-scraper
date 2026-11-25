@@ -232,7 +232,7 @@ def test_multiselect_stays_open_while_choosing():
 def test_sort_indicator_and_persistence():
     def check(root):
         tab = root.app.tabs["rent"]
-        root.app.sortdist_var.set(False)
+        tab.sortdist_var.set(False)
         tab.set_items(rent_items())
         tab.sort_by("price")
         pump(root, 100)
@@ -387,11 +387,90 @@ def test_resume_scores_jobs():
         pump(root, 100)
         assert "match" in tab.tree["columns"]
         col = list(tab.tree["columns"]).index("match")
-        cook = int(tab.tree.item("1", "values")[col])
-        clean = int(tab.tree.item("2", "values")[col])
-        assert cook > clean, (cook, clean)
+        cook_label = tab.tree.item("1", "values")[col]
+        assert "★" in cook_label, f"匹配列应显示星级: {cook_label!r}"
+        assert tab._find(1).match > tab._find(2).match
         assert geo.load_config()["resume_path"] == p
     with_gui(check)
+
+
+# ==================== v1.3.0 ====================
+import ai  # noqa: E402
+
+
+def _rent_with_distances():
+    items = []
+    for tid, d, level in ((1, 2.0, "地址"), (2, 4.0, "街区"), (3, 1.5, "区域"), (4, 9.0, "街区")):
+        it = k.Listing(tid=tid, category="rent", title=f"房源{tid}", sort="出租")
+        it.lat, it.lon, it.loc_level = -36.9, 174.9 + d / 90.0, level     # 经度差约对应 d km
+        items.append(it)
+    return items
+
+
+def test_distance_filter_in_rent_tab():
+    def check(root):
+        app = root.app
+        app.home = (-36.9, 174.9, "测试住址")
+        tab = app.tabs["rent"]
+        tab.set_items(_rent_with_distances())
+        tab.maxdist_var.set("5")
+        pump(root, 500)
+        assert sorted(rows(tab)) == [1, 2, 3], rows(tab)
+        tab.precise_var.set(True)
+        tab.refresh()
+        assert sorted(rows(tab)) == [1, 2], "只看位置可靠的: 应排除只知大区的帖子"
+        assert rows(tab)[0] == 1, "应由近到远排序"
+        assert app.tabs["job"].maxdist_var.get() == "", "两页的距离条件应互相独立"
+    with_gui(check)
+
+
+def test_settings_saves_api_key_encrypted():
+    key = "AIzaSyGUI-TEST-key-0987654321"
+
+    def check(root):
+        app = root.app
+        app.open_settings()
+        dlg = app.settings_dialog
+        dlg.key_var.set(key)
+        dlg.apply()
+    with_gui(check)
+    with open(geo.CONFIG_FILE, encoding="utf-8") as f:
+        assert key not in f.read(), "配置文件里出现了明文 API Key"
+    assert ai.get_api_key() == key
+    ai.save_api_key("")
+
+
+def test_ai_scores_shown_as_stars_with_reason():
+    def check(root):
+        app = root.app
+        tab = app.tabs["job"]
+        tab.set_items(job_items())
+        app.profile = __import__("resume").analyze("厨师 5 年")
+        app.apply_ai_scores({1: (92, "厨师经验完全对口"), 2: (15, "方向不符")})
+        col = list(tab.tree["columns"]).index("match")
+        assert tab.tree.item("1", "values")[col].startswith("★★★★★"), tab.tree.item("1", "values")[col]
+        assert tab._find(1).match == 92
+        tab.tree.selection_set("1")
+        pump(root, 100)
+        text = tab.detail.get("1.0", "end")
+        assert "厨师经验完全对口" in text and "AI" in text
+    with_gui(check)
+
+
+def test_ai_actions_without_key_point_to_settings():
+    shown = []
+    orig = messagebox.showinfo
+    messagebox.showinfo = lambda *a, **kw: shown.append(a)
+    os.environ.pop("GEMINI_API_KEY", None)
+    try:
+        def check(root):
+            ai.save_api_key("")
+            root.app.ai_score_jobs()
+            assert root.app.settings_dialog is not None and root.app.settings_dialog.winfo_exists()
+        with_gui(check)
+    finally:
+        messagebox.showinfo = orig
+    assert shown and "API Key" in " ".join(map(str, shown[0]))
 
 
 if __name__ == "__main__":

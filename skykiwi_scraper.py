@@ -579,6 +579,7 @@ class Criteria:
     exclude_ads: bool = False                           # 排除商家广告
     exclude_taken: bool = False                         # 排除标题注明已租 / 已招满的帖子
     max_distance: float | None = None                   # 距家最大距离 km (需先设置家庭住址)
+    precise_only: bool = False                          # 只看位置可靠的 (地址/街道/街区), 排除只知大区的估算
     sort_distance: bool = False                         # 按距离由近到远排序
 
 
@@ -660,6 +661,8 @@ def apply_filters(items: list[Listing], c: Criteria) -> list[Listing]:
         if c.position and not (_contains(it.position, c.position) or _contains(it.title, c.position)):
             continue
         if c.max_distance is not None and (it.distance is None or it.distance > c.max_distance):
+            continue
+        if c.precise_only and it.loc_level not in ("地址", "街道", "街区"):
             continue
         out.append(it)
     if c.sort_distance:

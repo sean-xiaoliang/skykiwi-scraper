@@ -103,9 +103,16 @@ class Profile:
     visa: str = ""
     years: int | None = None
     cat_hits: dict = field(default_factory=dict)
+    source: str = "本地"                                   # 本地关键词 / AI
+    ai_summary: str = ""
+    roles: list = field(default_factory=list)
+    strengths: list = field(default_factory=list)
+    suggestions: list = field(default_factory=list)
 
     def summary(self) -> str:
         """用于邮件正文的一句话简介。"""
+        if self.ai_summary:
+            return self.ai_summary
         parts = []
         if self.categories:
             exp = f"{self.years} 年" if self.years else ""
@@ -146,6 +153,13 @@ def analyze(text: str) -> Profile:
 
 
 # ---------------------------------------------------------------- 匹配 ----
+
+def stars(score) -> str:
+    """匹配度 -> 五星标签: 85+ 五星, 70+ 四星, 55+ 三星, 40+ 两星, 20+ 一星。"""
+    if score is None:
+        return ""
+    n = sum(score >= t for t in (20, 40, 55, 70, 85))
+    return "★" * n + "☆" * (5 - n)
 
 _NEEDS_ENGLISH = re.compile(r"英语|英文|english", re.I)
 _NEEDS_LICENCE = re.compile(r"驾照|有车|开车|licence|license|driver", re.I)

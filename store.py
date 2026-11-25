@@ -36,6 +36,9 @@ class PostCache:
                                detail_ok INTEGER, data TEXT NOT NULL, updated_at TEXT)""")
             con.execute("CREATE INDEX IF NOT EXISTS idx_posts_cat_date ON posts(category, post_date)")
             con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+            con.execute("""CREATE TABLE IF NOT EXISTS ai_scores (
+                               profile TEXT NOT NULL, tid INTEGER NOT NULL, score INTEGER, reason TEXT,
+                               PRIMARY KEY (profile, tid))""")
 
     @contextmanager
     def _db(self):
@@ -102,10 +105,22 @@ class PostCache:
         with _lock, self._db() as con:
             con.execute("DELETE FROM posts")
             con.execute("DELETE FROM meta")
+            con.execute("DELETE FROM ai_scores")
 
     def count(self, category: str) -> int:
         with self._db() as con:
             return con.execute("SELECT COUNT(*) FROM posts WHERE category=?", (category,)).fetchone()[0]
+
+    # ---- AI 评分 (按简历分析结果区分, 换简历后不会混用) ----
+    def save_ai_scores(self, profile: str, scores: dict):
+        with _lock, self._db() as con:
+            con.executemany("INSERT OR REPLACE INTO ai_scores VALUES (?,?,?,?)",
+                            [(profile, tid, sc, reason) for tid, (sc, reason) in scores.items()])
+
+    def load_ai_scores(self, profile: str) -> dict:
+        with self._db() as con:
+            return {tid: (sc, reason) for tid, sc, reason in
+                    con.execute("SELECT tid, score, reason FROM ai_scores WHERE profile=?", (profile,))}
 
     # ---- 元信息 ----
     def get_meta(self, key: str):

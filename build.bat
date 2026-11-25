@@ -6,6 +6,7 @@ python -m pip install -r requirements.txt pyinstaller
 python test_geo.py  || goto :failed
 python test_core.py || goto :failed
 python test_features.py || goto :failed
+python test_ai.py   || goto :failed
 python test_gui.py  || goto :failed
 python -m PyInstaller --noconfirm --clean --onefile --windowed ^
   --name SkykiwiScraper ^

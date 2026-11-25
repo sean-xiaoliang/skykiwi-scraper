@@ -20,6 +20,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk, messagebox, filedialog
 
+import ai
 import geo
 import mail
 import resume
@@ -38,7 +39,7 @@ VIEW_COLUMNS = {
             ("position", "职位", 12, "w"), ("nature", "性质", 6, "w"), ("salary_num", "时薪", 6, "e"),
             ("mail", "邮箱", 5, "center"), ("distance", "距离 km", 9, "e"), ("loc_desc", "定位依据", 20, "w")],
 }
-MATCH_COLUMN = ("match", "匹配", 6, "e")     # 上传简历后加到招聘页
+MATCH_COLUMN = ("match", "匹配", 12, "w")     # 上传简历后加到招聘页
 DEFAULT_SORTS = {"rent": {"出租"}, "job": {"招聘"}}     # 默认只看出租 / 招聘, 不看求租 / 求职
 
 
@@ -159,6 +160,10 @@ class CategoryTab:
         self.taken_var = tk.BooleanVar(value=True)
         self.sort_vars = {n: tk.BooleanVar(value=n in DEFAULT_SORTS[category])
                           for n in self.cfg["sortids"].values()}
+        dp = (geo.load_config().get("dist_prefs") or {}).get(category, {})
+        self.maxdist_var = tk.StringVar(value=dp.get("max", ""))
+        self.sortdist_var = tk.BooleanVar(value=dp.get("sort", True))
+        self.precise_var = tk.BooleanVar(value=dp.get("precise", False))
 
         box = ttk.LabelFrame(self.frame, text="筛选（修改后立即生效）", padding=(8, 4))
         box.pack(fill="x")
@@ -216,9 +221,25 @@ class CategoryTab:
         ttk.Label(r2, text="排除词:").pack(side="left")
         ttk.Entry(r2, width=18, textvariable=self.ex_var).pack(side="left", padx=2)
 
+        r3 = ttk.Frame(box)
+        r3.pack(fill="x", pady=(4, 2))
+        ttk.Label(r3, text="距家 ≤").pack(side="left")
+        self.maxdist_entry = ttk.Combobox(r3, width=6, textvariable=self.maxdist_var,
+                                          values=["", "1", "2", "3", "5", "8", "10", "15", "20", "30"])
+        self.maxdist_entry.pack(side="left", padx=2)
+        self.maxdist_entry.bind("<<ComboboxSelected>>", lambda e: self.refresh_soon())
+        ttk.Label(r3, text="km").pack(side="left")
+        ttk.Checkbutton(r3, text="由近到远排序", variable=self.sortdist_var,
+                        command=self._on_sortdist).pack(side="left", padx=(12, 2))
+        ttk.Checkbutton(r3, text="只看位置可靠的 (排除距离带 ≈ 的大区估算)", variable=self.precise_var,
+                        command=self._on_dist_change).pack(side="left", padx=(12, 2))
+        self.dist_hint = ttk.Label(r3, foreground="#999")
+        self.dist_hint.pack(side="left", padx=8)
+
         for v in (self.min_var, self.max_var, self.addr_var, self.kw_var, self.ex_var,
                   self.rent_type_var, self.house_type_var, self.pos_var):
             v.trace_add("write", lambda *a: self.refresh_soon())
+        self.maxdist_var.trace_add("write", lambda *a: self._on_dist_change())
 
         # ---- 招聘页: 简历分析 + 邮件申请 ----
         if not self.rent:
@@ -228,6 +249,9 @@ class CategoryTab:
             self.resume_label = tk.StringVar(value="未上传简历 (上传后按匹配度给岗位打分, 只在本机分析)")
             ttk.Label(act, textvariable=self.resume_label, foreground="#555").pack(side="left", padx=8)
             ttk.Button(act, text="查看分析", command=app.show_resume_report).pack(side="left")
+            ttk.Separator(act, orient="vertical").pack(side="left", fill="y", padx=8)
+            ttk.Button(act, text="AI 分析简历", command=app.ai_analyze_resume).pack(side="left")
+            ttk.Button(act, text="AI 评估岗位", command=app.ai_score_jobs).pack(side="left", padx=4)
             self.btn_mail = ttk.Button(act, text="✉ 邮件申请选中岗位", state="disabled", command=self.send_mail)
             self.btn_mail.pack(side="right")
 
@@ -263,6 +287,23 @@ class CategoryTab:
         self.tree.bind("<Return>", self.open_selected)
         self.tree.bind("<Control-c>", self.copy_selected)
         self.set_detail("抓取后在这里显示选中帖子的详细信息。双击或按回车在浏览器打开原帖。")
+
+    # ---- 距离条件 (每页独立, 记在配置里) ----
+    def _save_dist_prefs(self):
+        cfg = geo.load_config()
+        cfg.setdefault("dist_prefs", {})[self.cat] = {"max": self.maxdist_var.get().strip(),
+                                                      "sort": self.sortdist_var.get(),
+                                                      "precise": self.precise_var.get()}
+        geo.save_config(cfg)
+
+    def _on_dist_change(self):
+        self._save_dist_prefs()
+        self.refresh_soon()
+
+    def _on_sortdist(self):
+        self.clear_manual_sort()
+        self._save_dist_prefs()
+        self.refresh()
 
     # ---- 列 ----
     def view_columns(self):
@@ -344,19 +385,24 @@ class CategoryTab:
             nature="" if self.rent or nature in ("", "全部") else nature,
             position=self.pos_var.get().strip() if not self.rent else "",
             exclude_ads=self.noads_var.get(), exclude_taken=self.taken_var.get(),
-            max_distance=app.max_distance() if home else None,
-            sort_distance=app.sortdist_var.get() and bool(home) and self.sort_key is None)
+            max_distance=self._num(self.maxdist_var, self.maxdist_entry) if home else None,
+            precise_only=self.precise_var.get(),
+            sort_distance=self.sortdist_var.get() and bool(home) and self.sort_key is None)
 
     def refresh(self):
         self._after = None
         core = self.core
         geo.compute_distances(self.items, self.app.home)
         if not self.rent:
-            prof = self.app.profile
+            prof, ai_scores = self.app.profile, self.app.ai_scores
             for it in self.items:
                 it.mail = "✉" if mail.job_emails(it) else ""
-                it.match = resume.match(prof, it) if prof else None
+                if it.tid in ai_scores:
+                    it.match, it.ai_reason = ai_scores[it.tid]
+                else:
+                    it.match, it.ai_reason = (resume.match(prof, it) if prof else None), None
         crit = self.criteria()
+        self.dist_hint.configure(text="" if self.app.home else "(先在上方设置家庭住址)")
         shown = core.apply_filters(self.items, crit)
         if self.sort_key:
             shown = core.sort_listings(shown, self.sort_key, self.sort_rev)
@@ -368,6 +414,10 @@ class CategoryTab:
     def _cell(self, it, key):
         if key == "distance":
             return self.core.format_distance(it)
+        if key == "match":
+            if getattr(it, "match", None) is None:
+                return ""
+            return resume.stars(it.match) + (" AI" if getattr(it, "ai_reason", None) is not None else "")
         v = getattr(it, key, "")
         if v is None:
             return ""
@@ -416,6 +466,9 @@ class CategoryTab:
         for n, v in self.sort_vars.items():
             v.set(n in DEFAULT_SORTS[self.cat])
         self.type_select.set([])
+        self.maxdist_var.set("")
+        self.sortdist_var.set(True)
+        self.precise_var.set(False)
         self.clear_manual_sort()
         self.refresh()
 
@@ -456,8 +509,12 @@ class CategoryTab:
         emails = mail.job_emails(it) if not self.rent else []
         lines.append(f"电话: {it.phone or '-'}    微信: {it.wechat or '-'}"
                      + (f"    邮箱: {', '.join(emails)}" if emails else ""))
-        if not self.rent and self.app.profile:
-            lines.append(f"简历匹配度: {resume.match(self.app.profile, it)} / 100")
+        if not self.rent and getattr(it, "match", None) is not None:
+            if getattr(it, "ai_reason", None) is not None:
+                lines.append(f"AI 匹配度: {it.match} / 100  {resume.stars(it.match)}    理由: {it.ai_reason}")
+            else:
+                lines.append(f"简历匹配度 (本地关键词): {it.match} / 100  {resume.stars(it.match)}"
+                             "    点「AI 评估岗位」可得到更准确的评分和理由")
         for k, v in it.extra.items():
             lines.append(f"{k}: {v}")
         lines += ["", it.content]
@@ -522,8 +579,9 @@ class App:
         self.home = ((cfg["home_lat"], cfg["home_lon"], cfg.get("home_desc", ""))
                      if cfg.get("home_lat") is not None else None)
         self.cache = store.PostCache()
-        self.profile = None                 # 简历分析结果
+        self.profile = None                 # 简历分析结果 (本地关键词或 AI)
         self.resume_path = ""
+        self.ai_scores: dict = {}           # {帖子ID: (分数, 理由)}
         self.settings_dialog = None
 
         self._setup_window()
@@ -587,8 +645,6 @@ class App:
         box = ttk.LabelFrame(self.root, text="家庭住址 / 距离（租房和招聘通用）", padding=(8, 4))
         box.pack(fill="x", padx=8)
         self.home_var = tk.StringVar(value=cfg.get("home_text", ""))
-        self.maxdist_var = tk.StringVar(value=cfg.get("max_distance", ""))
-        self.sortdist_var = tk.BooleanVar(value=bool(cfg.get("sort_distance", True)))
         self.online_var = tk.BooleanVar(value=bool(cfg.get("online_geocode", True)))
         self.btn_here = ttk.Button(box, text="◎ 一键定位当前位置", command=self.locate_here)
         self.btn_here.pack(side="left", padx=(0, 10))
@@ -598,14 +654,8 @@ class App:
         e.bind("<Return>", lambda ev: self.locate_home())
         self.btn_home = ttk.Button(box, text="按地址定位", command=self.locate_home)
         self.btn_home.pack(side="left", padx=4)
-        ttk.Label(box, text="   最大距离 km:").pack(side="left")
-        self.maxdist_entry = ttk.Entry(box, width=6, textvariable=self.maxdist_var)
-        self.maxdist_entry.pack(side="left")
-        self.maxdist_var.trace_add("write", lambda *a: self._on_maxdist())
-        ttk.Checkbutton(box, text="按距离排序 (近→远)", variable=self.sortdist_var,
-                        command=self._on_sortdist).pack(side="left", padx=10)
         ttk.Checkbutton(box, text="联网解析帖子地址 (更准)", variable=self.online_var,
-                        command=self._on_online_toggle).pack(side="left")
+                        command=self._on_online_toggle).pack(side="left", padx=(12, 0))
         self.home_status = tk.StringVar()
         ttk.Label(self.root, textvariable=self.home_status, foreground="#2E6E2E",
                   padding=(16, 2)).pack(fill="x")
@@ -667,10 +717,11 @@ class App:
         except resume.ResumeError as e:
             messagebox.showwarning("简历", str(e))
             return False
-        self.profile, self.resume_path = prof, path
+        self.profile, self.resume_path = self._saved_ai_profile(path) or prof, path
         cfg = geo.load_config()
         cfg["resume_path"] = path
         geo.save_config(cfg)
+        self._load_ai_scores()
         job = self.tabs["job"]
         if prof.keywords:
             job.resume_label.set(f"简历: {os.path.basename(path)} · 方向: {'、'.join(prof.categories[:3])}")
@@ -687,10 +738,83 @@ class App:
     def _load_resume_silently(self, path):
         if path and os.path.exists(path):
             try:
-                self.profile = resume.analyze(resume.extract_text(path))
+                self.profile = self._saved_ai_profile(path) or resume.analyze(resume.extract_text(path))
                 self.resume_path = path
+                self._load_ai_scores()
             except resume.ResumeError:
                 self.core.log.warning("启动时读取简历失败: %s", path)
+
+    # ---- AI (Gemini) ----
+    def _saved_ai_profile(self, path):
+        """简历文件没变时复用上次的 AI 分析结果, 不重复调用 AI。"""
+        saved = geo.load_config().get("ai_profile") or {}
+        try:
+            if saved.get("path") == path and saved.get("mtime") == os.path.getmtime(path):
+                return resume.Profile(**saved["data"])
+        except (OSError, TypeError, KeyError):
+            pass
+        return None
+
+    def _ai_key(self):
+        return ai.profile_key(self.profile, geo.load_config().get("gemini_model_used", "")) if self.profile else ""
+
+    def _load_ai_scores(self):
+        self.ai_scores = self.cache.load_ai_scores(self._ai_key()) if self.profile else {}
+
+    def _need_ai_key(self) -> bool:
+        if ai.get_api_key():
+            return False
+        messagebox.showinfo("AI 功能", "请先在设置中填写 Google Gemini API Key。\n\n"
+                                     f"免费申请: {ai.KEY_URL}")
+        self.open_settings()
+        return True
+
+    def apply_ai_scores(self, scores: dict):
+        self.ai_scores.update(scores)
+        job = self.tabs["job"]
+        job.enable_match_column(True)
+        job.refresh()
+
+    def ai_analyze_resume(self):
+        if not self.resume_path:
+            messagebox.showinfo("AI 分析简历", "请先点「上传简历…」选择简历文件")
+            return
+        if self._need_ai_key():
+            return
+        path, redact_on = self.resume_path, bool(geo.load_config().get("ai_redact", True))
+        if self.begin_task("AI 分析简历") is None:
+            return
+
+        def work():
+            g = ai.client()
+            prof = ai.analyze_resume(g, resume.extract_text(path), redact_personal=redact_on)
+            self.msgq.put(("ai_profile", (prof, g.model, path)))
+        self._run(self.task, work)
+
+    def ai_score_jobs(self):
+        if self._need_ai_key():
+            return
+        if not self.profile:
+            messagebox.showinfo("AI 评估岗位", "请先点「上传简历…」选择简历文件")
+            return
+        job = self.tabs["job"]
+        todo = [it for it in job.shown if it.sort != "求职" and it.tid not in self.ai_scores]
+        todo.sort(key=lambda it: -(it.match or 0))
+        todo = todo[:60]                                   # 控制每次调用量
+        if not todo:
+            self.status.set("当前显示的岗位都已用 AI 评估过")
+            return
+        stop = self.begin_task(f"AI 评估 {len(todo)} 个岗位", stoppable=True)
+        if stop is None:
+            return
+        prof = self.profile
+
+        def work():
+            g = ai.client()
+            res = ai.score_jobs(g, prof, todo, progress=lambda d, t: self.msgq.put(("prog", (d, t))),
+                                stop_event=stop)
+            self.msgq.put(("ai_scores", (res, g.model)))
+        self._run(self.task, work)
 
     def show_resume_report(self):
         prof = self.profile
@@ -699,7 +823,11 @@ class App:
             return
         job = self.tabs["job"]
         top = sorted((it for it in job.items if getattr(it, "match", None)), key=lambda it: -it.match)[:10]
-        lines = [f"简历文件: {self.resume_path}", "（分析只在本机进行, 不会上传）", ""]
+        if prof.source == "AI":
+            lines = [f"简历文件: {self.resume_path}", "（AI 分析: Google Gemini）", "",
+                     f"简介: {prof.ai_summary}", f"适合职位: {'、'.join(prof.roles) or '-'}", ""]
+        else:
+            lines = [f"简历文件: {self.resume_path}", "（本地关键词分析, 不会上传; 点「AI 分析简历」可得到更准确的结果）", ""]
         if prof.cat_hits:
             lines.append("技能方向:")
             lines += [f"  · {c}: {'、'.join(prof.cat_hits[c][:8])}" for c in prof.categories]
@@ -709,10 +837,15 @@ class App:
                   f"证照: {'、'.join(prof.licences) or '未写明'}",
                   f"签证: {prof.visa or '未写明'}",
                   f"工作年限: {f'{prof.years} 年' if prof.years else '未写明'}",
-                  "", "匹配度计算: 岗位类别吻合 +35, 每个技能关键词 +15 (最多 45), "
-                      "满足 / 不满足 英语和驾照要求 ±10",
+                  ]
+        if prof.strengths:
+            lines += ["", "求职优势:"] + [f"  · {x}" for x in prof.strengths]
+        if prof.suggestions:
+            lines += ["", "简历改进建议:"] + [f"  · {x}" for x in prof.suggestions]
+        lines += ["", "星级: ★★★★★ 85+  ★★★★ 70+  ★★★ 55+  ★★ 40+  ★ 20+ (满分 100); "
+                      "带「AI」的是 AI 评分, 其余为本地关键词评分",
                   "", f"当前招聘页匹配度最高的 {len(top)} 个岗位:"]
-        lines += [f"  {it.match:>3}  {it.title}" for it in top] or ["  (先刷新招聘页)"]
+        lines += [f"  {resume.stars(it.match)} {it.match:>3}  {it.title}" for it in top] or ["  (先刷新招聘页)"]
         win = tk.Toplevel(self.root)
         win.title("简历分析")
         win.transient(self.root)
@@ -739,43 +872,17 @@ class App:
         for t in self.tabs.values():
             t.refresh()
 
-    # ---- 距离设置 ----
-    def max_distance(self):
-        s = self.maxdist_var.get().strip()
-        if not s:
-            self.maxdist_entry.configure(style="TEntry")
-            return None
-        try:
-            v = float(s)
-            self.maxdist_entry.configure(style="TEntry")
-            return v
-        except ValueError:
-            self.maxdist_entry.configure(style="Bad.TEntry")
-            return None
-
-    def _on_maxdist(self):
-        self.save_prefs()
-        for t in self.tabs.values():
-            t.refresh_soon()
-
-    def _on_sortdist(self):
-        for t in self.tabs.values():
-            t.clear_manual_sort()
-        self.save_prefs()
-        self.refresh_all()
-
     def show_home_status(self):
         h = self.home
         if h:
-            self.home_status.set(f"✔ 住址: {h[2][:90]}  ({h[0]:.5f}, {h[1]:.5f})   —— 距离为直线距离; "
-                                 f"灰色行只知道大区, 距离带「≈」")
+            self.home_status.set(f"✔ 住址: {h[2][:90]}  ({h[0]:.5f}, {h[1]:.5f})   —— 距离为直线距离, "
+                                 f"在各页的「距家 ≤」中按距离检索; 灰色行只知道大区, 距离带「≈」")
         else:
             self.home_status.set("未设置家庭住址: 在家时点「◎ 一键定位当前位置」, 或输入街道地址 / 街区名后点「按地址定位」")
 
     def save_prefs(self):
         c = geo.load_config()
-        c.update(home_text=self.home_var.get().strip(), max_distance=self.maxdist_var.get().strip(),
-                 sort_distance=self.sortdist_var.get(), online_geocode=self.online_var.get())
+        c.update(home_text=self.home_var.get().strip(), online_geocode=self.online_var.get())
         if self.home:
             c.update(home_lat=self.home[0], home_lon=self.home[1], home_desc=self.home[2])
         else:
@@ -984,6 +1091,35 @@ class App:
             self.end_task()
             self.show_home_status()
             messagebox.showwarning("一键定位失败", data)
+        elif kind == "ai_profile":
+            prof, model, path = data
+            self.end_task()
+            self.profile = prof
+            cfg = geo.load_config()
+            cfg["gemini_model_used"] = model
+            try:
+                cfg["ai_profile"] = {"path": path, "mtime": os.path.getmtime(path),
+                                     "data": __import__("dataclasses").asdict(prof)}
+            except OSError:
+                pass
+            geo.save_config(cfg)
+            self._load_ai_scores()
+            job = self.tabs["job"]
+            job.resume_label.set(f"简历: {os.path.basename(path)} · AI 分析 ({model}) · "
+                                 f"方向: {'、'.join(prof.categories[:3]) or '未识别'}")
+            job.refresh()
+            self.status.set("AI 简历分析完成; 点「AI 评估岗位」可让 AI 给当前显示的岗位打分")
+            self.show_resume_report()
+        elif kind == "ai_scores":
+            res, model = data
+            self.end_task()
+            cfg = geo.load_config()
+            if cfg.get("gemini_model_used") != model:
+                cfg["gemini_model_used"] = model
+                geo.save_config(cfg)
+            self.cache.save_ai_scores(self._ai_key(), res)
+            self.apply_ai_scores(res)
+            self.status.set(f"AI 已评估 {len(res)} 个岗位 (匹配列带「AI」); 选中岗位可在下方看理由")
         elif kind == "relocated":
             self.end_task()
             self.status.set("帖子位置已更新")
@@ -1070,6 +1206,29 @@ class SettingsDialog(tk.Toplevel):
         ttk.Checkbutton(m, text="打开写信窗口时在资源管理器中选中简历 (邮件链接无法自动带附件)",
                         variable=self.reveal_var).grid(row=6, column=1, sticky="w", padx=4, pady=(4, 0))
 
+        a = ttk.LabelFrame(self, text="AI 简历分析 (Google Gemini)", padding=8)
+        a.pack(fill="x", **pad)
+        self._old_key = ai.get_api_key()
+        self.key_var = tk.StringVar(value=self._old_key)
+        ttk.Label(a, text="API Key:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(a, width=46, textvariable=self.key_var, show="•").grid(row=0, column=1, sticky="w", padx=4)
+        link = ttk.Label(a, text="免费申请 Key", foreground="#0563C1", cursor="hand2")
+        link.grid(row=0, column=2, sticky="w")
+        link.bind("<Button-1>", lambda e: webbrowser.open(ai.KEY_URL))
+        ttk.Label(a, text="模型:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.AUTO = "自动 (最新的 Flash 模型)"
+        self.model_var = tk.StringVar(value=cfg.get("gemini_model") or self.AUTO)
+        self.model_box = ttk.Combobox(a, width=44, textvariable=self.model_var, values=[self.AUTO])
+        self.model_box.grid(row=1, column=1, sticky="w", padx=4, pady=(4, 0))
+        ttk.Button(a, text="获取可用模型", command=self.fetch_models).grid(row=1, column=2, sticky="w", pady=(4, 0))
+        self.redact_var = tk.BooleanVar(value=bool(cfg.get("ai_redact", True)))
+        ttk.Checkbutton(a, text="发送前去掉简历中的电话、邮箱、微信号", variable=self.redact_var).grid(
+            row=2, column=1, columnspan=2, sticky="w", padx=4, pady=(4, 0))
+        ttk.Label(a, text="使用 AI 时, 简历内容 (AI 分析简历) 和岗位信息 (AI 评估岗位) 会发送给 Google 处理;\n"
+                          "Key 用 Windows 加密保存在本机。不填 Key 则只用本地关键词匹配。",
+                  foreground="#555", justify="left").grid(row=3, column=1, columnspan=2, sticky="w", padx=4,
+                                                          pady=(4, 0))
+
         t = ttk.LabelFrame(self, text="表格", padding=8)
         t.pack(fill="x", **pad)
         ttk.Label(t, text="拖动表头边缘可调整列宽, 程序会记住。").pack(side="left")
@@ -1080,6 +1239,33 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(b, text="确定", command=self.apply).pack(side="right", padx=4)
         ttk.Button(b, text="取消", command=self.destroy).pack(side="right")
         self.bind("<Escape>", lambda e: self.destroy())
+
+    def fetch_models(self):
+        key = self.key_var.get().strip()
+        if not key:
+            messagebox.showinfo("获取模型", "请先填写 API Key", parent=self)
+            return
+        self.model_box.configure(values=[self.AUTO, "正在获取 ..."])
+
+        def work():
+            try:
+                names = ai.Gemini(key).list_models()
+                self.after(0, lambda: self._models_ready(names, None))
+            except ai.GeminiError as e:
+                msg = str(e)
+                self.after(0, lambda: self._models_ready([], msg))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _models_ready(self, names, error):
+        if not self.winfo_exists():
+            return
+        if error:
+            self.model_box.configure(values=[self.AUTO])
+            messagebox.showwarning("获取模型", error, parent=self)
+            return
+        best = ai.pick_model(names)
+        self.model_box.configure(values=[self.AUTO] + sorted(names, reverse=True))
+        messagebox.showinfo("获取模型", f"可用模型 {len(names)} 个; 自动模式会使用: {best}", parent=self)
 
     def _key(self, mapping, label, default):
         return next((k for k, v in mapping.items() if v == label), default)
@@ -1096,8 +1282,13 @@ class SettingsDialog(tk.Toplevel):
                    webmail=self._key(mail.WEBMAIL, self.webmail_var.get(), "gmail"),
                    mail_subject=self.subject_var.get().strip() or mail.DEFAULT_SUBJECT,
                    mail_body=self.body_text.get("1.0", "end").rstrip() + "\n",
-                   reveal_resume=self.reveal_var.get())
+                   reveal_resume=self.reveal_var.get(), ai_redact=self.redact_var.get())
+        model = self.model_var.get().strip()
+        cfg["gemini_model"] = "" if model in (self.AUTO, "正在获取 ...") else model
         geo.save_config(cfg)
+        key = self.key_var.get().strip()
+        if key != self._old_key:
+            ai.save_api_key(key)
         self.destroy()
         if days != old_days:
             self.app.load_cached()
