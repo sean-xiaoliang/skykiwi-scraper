@@ -91,9 +91,9 @@ def test_export_failure_shows_error():
     try:
         def check(root):
             # 放入一条数据, 让导出有内容
-            k.Scraper.scrape = lambda self, cat, days=10, **kw: [
-                k.Listing(tid=1, category=cat, title="t", sort="出租" if cat == "rent" else "招聘")]
-            find(root, ttk.Button, "抓取").invoke()
+            k.Scraper.refresh = lambda self, cat, days, cache, **kw: ([
+                k.Listing(tid=1, category=cat, title="t", sort="出租" if cat == "rent" else "招聘")], 1)
+            find(root, ttk.Button, "刷新").invoke()
             for _ in range(40):
                 root.update()
                 root.after(50)
@@ -254,6 +254,143 @@ def test_keyboard_shortcuts_bound():
     def check(root):
         assert root.bind("<F5>"), "F5 未绑定"
         assert root.bind("<Control-e>"), "Ctrl+E 未绑定"
+    with_gui(check)
+
+
+# ==================== v1.2.0 ====================
+import geo  # noqa: E402
+import store  # noqa: E402
+import mail  # noqa: E402
+
+
+def test_title_column_narrow_and_all_resizable():
+    def check(root):
+        app = root.app
+        for tab in app.tabs.values():
+            assert tab.tree.column("title", "width") <= int(260 * app.ui), tab.tree.column("title", "width")
+            for c in tab.tree["columns"]:
+                assert not tab.tree.column(c, "stretch"), f"{c} 会自动拉伸, 用户调好的宽度会被改掉"
+    with_gui(check)
+
+
+def test_column_widths_remembered():
+    def first(root):
+        tab = root.app.tabs["job"]
+        tab.tree.column("title", width=333)
+        tab.save_column_widths()
+    with_gui(first)
+
+    def second(root):
+        tab = root.app.tabs["job"]
+        w = tab.tree.column("title", "width")
+        tab.reset_column_widths()          # 清理, 不影响其他测试
+        assert abs(w - 333) <= 2, w
+    with_gui(second)
+
+
+def test_settings_dialog_changes_days():
+    def check(root):
+        app = root.app
+        app.open_settings()
+        dlg = app.settings_dialog
+        dlg.days_var.set(15)
+        dlg.apply()
+        assert geo.load_config()["display_days"] == 15
+        assert app.display_days() == 15
+        assert not dlg.winfo_exists()
+    with_gui(check)
+
+
+def test_cached_posts_shown_on_startup():
+    store.PostCache().save([k.Listing(tid=777, category="rent", title="缓存里的房源", sort="出租",
+                                      post_date=__import__("datetime").date.today().isoformat())])
+
+    def check(root):
+        assert "777" in root.app.tabs["rent"].tree.get_children()
+    with_gui(check)
+
+
+def test_fetch_uses_incremental_refresh():
+    called = []
+    orig = k.Scraper.refresh
+
+    def fake(self, cat, days, cache, **kw):
+        called.append((cat, days))
+        return [], 0
+    k.Scraper.refresh = fake
+    try:
+        def check(root):
+            root.app.start_fetch()
+            pump(root, 800)
+        with_gui(check)
+    finally:
+        k.Scraper.refresh = orig
+    assert called and called[0][0] == "rent", called
+
+
+def job_items():
+    a = k.Listing(tid=1, category="job", title="中餐厅招厨师", sort="招聘", region="服务人员", position="厨师",
+                  company="好吃餐厅", email="hr@food.co.nz", content="需要炒锅经验", url="https://x/1")
+    b = k.Listing(tid=2, category="job", title="招清洁工", sort="招聘", region="清洁/家政", position="清洁",
+                  content="家庭清洁, 电话联系", url="https://x/2")
+    return [a, b]
+
+
+def test_email_button_follows_selection():
+    def check(root):
+        app = root.app
+        app.notebook.select(app.tabs["job"].frame)
+        tab = app.tabs["job"]
+        tab.set_items(job_items())
+        tab.tree.selection_set("1")
+        pump(root, 100)
+        assert str(tab.btn_mail.cget("state")) == "normal"
+        tab.tree.selection_set("2")
+        pump(root, 100)
+        assert str(tab.btn_mail.cget("state")) == "disabled"
+    with_gui(check)
+
+
+def test_email_compose_uses_webmail_when_no_client():
+    sent, orig = [], (mail.compose, mail.detect_mail_client, mail.reveal_file)
+    mail.compose = lambda to, subject, body, method: sent.append((to, subject, body, method))
+    mail.detect_mail_client = lambda: None
+    mail.reveal_file = lambda p: None
+    try:
+        def check(root):
+            app = root.app
+            tab = app.tabs["job"]
+            tab.set_items(job_items())
+            tab.tree.selection_set("1")
+            pump(root, 100)
+            tab.send_mail()
+        with_gui(check)
+    finally:
+        mail.compose, mail.detect_mail_client, mail.reveal_file = orig
+    assert sent, "没有打开写信窗口"
+    to, subject, body, method = sent[0]
+    assert to == "hr@food.co.nz" and "厨师" in subject and method == "gmail", sent[0]
+    assert "https://x/1" in body
+
+
+def test_resume_scores_jobs():
+    import tempfile as tf
+    p = os.path.join(tf.mkdtemp(), "cv.txt")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("厨师 5 年经验，熟悉炒锅。英语流利，有驾照。")
+
+    def check(root):
+        app = root.app
+        tab = app.tabs["job"]
+        tab.set_items(job_items())
+        app.load_resume(p)
+        pump(root, 100)
+        assert "match" in tab.tree["columns"]
+        col = list(tab.tree["columns"]).index("match")
+        cook = int(tab.tree.item("1", "values")[col])
+        clean = int(tab.tree.item("2", "values")[col])
+        assert cook > clean, (cook, clean)
+        assert geo.load_config()["resume_path"] == p
     with_gui(check)
 
 

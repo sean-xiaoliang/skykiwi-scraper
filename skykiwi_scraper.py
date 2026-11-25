@@ -206,12 +206,20 @@ class Scraper:
         raise RuntimeError(f"请求失败: {url} ({last})")
 
     # ---- 列表页 ----
-    def list_threads(self, category: str, days: int, max_pages: int = 40,
-                     progress=None) -> list[Listing]:
+    def list_threads(self, category: str, days: int, max_pages: int = 40, progress=None,
+                     known: set | None = None, covered_since: dt.date | None = None) -> list[Listing]:
+        """读取列表页 (按发帖时间倒序)。
+
+        known / covered_since 用于增量刷新: 缓存已完整覆盖到截止日期时, 遇到整页都是已缓存的帖子就停止翻页。
+        结束后 self.last_list_complete 表示是否完整读到了截止日期 (未被停止 / 出错 / 达到页数上限)。
+        """
         cfg = CATEGORIES[category]
         days = max(1, int(days))
         cutoff = dt.date.today() - dt.timedelta(days=days - 1)
+        known = known or set()
+        cache_covers = covered_since is not None and covered_since <= cutoff
         results: dict[int, Listing] = {}
+        self.last_list_complete = False
         for page in range(1, max_pages + 1):
             url = (f"{BASE}forum.php?mod=forumdisplay&fid={cfg['fid']}"
                    f"&filter=author&orderby=dateline&page={page}")
@@ -229,7 +237,7 @@ class Scraper:
                 break
             if page == max_pages:
                 self.log(f"已达到最多 {max_pages} 页的上限, 更早的帖子未读取")
-            rows, normal_dates = self._parse_list(html, category)
+            rows, normal_dates, normal_tids = self._parse_list(html, category)
             for it in rows:
                 d = _to_date(it.post_date)
                 if d and d >= cutoff and it.tid not in results:
@@ -238,6 +246,11 @@ class Scraper:
                 progress(page, None)
             # 按发帖时间倒序: 本页普通帖全部早于截止日期 -> 停止翻页
             if not normal_dates or all(d < cutoff for d in normal_dates):
+                self.last_list_complete = True
+                break
+            if cache_covers and normal_tids and all(t in known for t in normal_tids):
+                self.log("后面的帖子都已在本地缓存中")
+                self.last_list_complete = True
                 break
             if self.stop_event.is_set():
                 break
@@ -246,7 +259,7 @@ class Scraper:
 
     def _parse_list(self, html: str, category: str):
         soup = BeautifulSoup(html, "html.parser")
-        items, normal_dates = [], []
+        items, normal_dates, normal_tids = [], [], []
         for tb in soup.select('tbody[id^="normalthread_"], tbody[id^="stickthread_"]'):
             tid = int(tb["id"].split("_")[1])
             th = tb.find("th")
@@ -278,11 +291,12 @@ class Scraper:
                 it.replies = _to_int(a2.get_text() if a2 else "")
                 it.views = _to_int(em2.get_text() if em2 else "")
             items.append(it)
-            if tb["id"].startswith("normalthread_"):
+            if tb["id"].startswith("normalthread_"):     # 置顶帖不参与翻页判断
+                normal_tids.append(tid)
                 d = _to_date(it.post_date)
                 if d:
                     normal_dates.append(d)
-        return items, normal_dates
+        return items, normal_dates, normal_tids
 
     # ---- 详情页 ----
     def fetch_detail(self, it: Listing) -> Listing:
@@ -346,10 +360,40 @@ class Scraper:
 
     def _scrape(self, category, days, with_detail, progress) -> list[Listing]:
         items = self.list_threads(category, days, progress=progress)
+        self._fetch_details(items, with_detail, progress)
+        return items
+
+    def refresh(self, category: str, days: int, cache, with_detail: bool = True, progress=None,
+                online_geocode: bool = True):
+        """增量刷新: 只读取新帖的详情, 结果存入本地缓存。返回 (缓存中最近 days 天的帖子, 新帖数)。"""
+        days = max(1, int(days))
+        known = cache.known(category)
+        cov = cache.get_meta(f"covered_since_{category}")
+        covered = _to_date(cov) if cov else None
+        listed = self.list_threads(category, days, progress=progress, known=set(known), covered_since=covered)
+        complete = self.last_list_complete
+        new = [it for it in listed if it.tid not in known or (with_detail and not known[it.tid])]
+        cache.update_counts([(it.tid, it.replies, it.views) for it in listed if it.tid in known])
+        if new:
+            self.log(f"发现 {len(new)} 条新帖, 读取详情 ...")
+            self._fetch_details(new, with_detail, progress)
+            locate_items(new, online_geocode, log=self.log, progress=progress, stop_event=self.stop_event)
+            cache.save([it for it in new if it.detail_ok or not with_detail])
+        else:
+            self.log("没有新帖")
+        if complete:
+            cutoff = dt.date.today() - dt.timedelta(days=days - 1)
+            if covered is None or cutoff < covered:
+                cache.set_meta(f"covered_since_{category}", cutoff.isoformat())
+        cache.set_meta(f"last_refresh_{category}", dt.datetime.now().isoformat(timespec="seconds"))
+        cache.prune(keep_days=max(60, days + 5))
+        return cache.load(category, days), len(new)
+
+    def _fetch_details(self, items, with_detail, progress):
         if not with_detail or not items:
             for it in items:
                 self._post_process(it)
-            return items
+            return
         total, done = len(items), 0
         self.log(f"开始读取 {total} 个帖子详情 (并发 {self.workers}) ...")
         with ThreadPoolExecutor(max_workers=self.workers) as ex:
@@ -374,7 +418,6 @@ class Scraper:
         for it in items:
             if not it.detail_ok:
                 self._post_process(it)
-        return items
 
 
 def locate_items(items: list[Listing], online_geocode: bool = True, log=print, progress=None,
@@ -715,6 +758,7 @@ def run_cli(argv=None):
     p.add_argument("--position", default="", help="职位包含")
     p.add_argument("--no-ads", action="store_true", help="排除商家广告")
     p.add_argument("--no-detail", action="store_true", help="只抓列表,不进帖子(更快,但没有租金等字段)")
+    p.add_argument("--no-cache", action="store_true", help="不用本地缓存, 重新抓取全部帖子 (默认只抓新帖)")
     p.add_argument("--here", action="store_true", help="用本机当前位置 (Windows 定位服务) 作为家庭住址")
     p.add_argument("--home", help="家庭住址 (街道地址 / 街区名 / '纬度,经度'); 不填则使用图形界面保存的住址")
     p.add_argument("--max-distance", type=float, help="距家最大距离 km")
@@ -733,8 +777,14 @@ def run_cli(argv=None):
             last[0] = time.time()
             print(f"  进度 {done}/{total}")
 
-    items = sc.scrape(a.category, a.days, with_detail=not a.no_detail, progress=prog,
-                      online_geocode=not a.no_geocode)
+    if a.no_cache:
+        items = sc.scrape(a.category, a.days, with_detail=not a.no_detail, progress=prog,
+                          online_geocode=not a.no_geocode)
+    else:
+        import store
+        items, n_new = sc.refresh(a.category, a.days, store.PostCache(), with_detail=not a.no_detail,
+                                  progress=prog, online_geocode=not a.no_geocode)
+        print(f"新帖 {n_new} 条 (其余来自本地缓存)")
     home = None
     cfg = geo.load_config()
     if a.here:

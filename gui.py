@@ -3,9 +3,10 @@
 图形界面 (Tkinter)。由 skykiwi_scraper.run_gui() 调用; core 为主模块 (抓取 / 筛选 / 导出)。
 
 结构:
-  App          顶部工具栏 (抓取 / 停止 / 导出)、家庭住址栏、两个标签页、底部状态栏; 后台任务一次只跑一个
-  CategoryTab  一个类别 (租房 / 招聘) 的筛选条件、结果表、排序和详情区, 两页互不影响
-  MultiSelect  可多选的下拉框: 勾选时不收起, 点外面或按 Esc 关闭
+  App            顶部工具栏 (刷新 / 停止 / 导出 / 设置)、家庭住址栏、两个标签页、底部状态栏; 后台任务一次只跑一个
+  CategoryTab    一个类别 (租房 / 招聘) 的筛选条件、结果表、排序和详情区, 两页互不影响; 招聘页另有简历和邮件申请
+  MultiSelect    可多选的下拉框: 勾选时不收起, 点外面或按 Esc 关闭
+  SettingsDialog 软件设置: 显示天数、是否读取详情、邮件方式和模板、列宽、清空缓存
 """
 
 from __future__ import annotations
@@ -20,18 +21,24 @@ import tkinter.font as tkfont
 from tkinter import ttk, messagebox, filedialog
 
 import geo
+import mail
+import resume
+import store
 
 DEBOUNCE_MS = 300      # 输入框停止输入后多久刷新结果
+DEFAULT_DAYS = 10      # 默认显示最近 10 天
 
 # 表格只显示关键列 (其余字段在下方详情区和导出的 Excel 里): (字段, 表头, 宽度单位, 对齐)
+# 所有列都不自动拉伸: 拖动表头边缘调整的宽度会被记住
 VIEW_COLUMNS = {
-    "rent": [("post_date", "日期", 9, "w"), ("region", "区域", 7, "w"), ("title", "标题", 40, "w"),
+    "rent": [("post_date", "日期", 9, "w"), ("region", "区域", 7, "w"), ("title", "标题", 26, "w"),
              ("price", "周租金", 7, "e"), ("distance", "距离 km", 9, "e"), ("rent_type", "出租类型", 12, "w"),
              ("house_type", "房屋类型", 12, "w"), ("loc_desc", "定位依据", 20, "w")],
-    "job": [("post_date", "日期", 9, "w"), ("region", "岗位类别", 9, "w"), ("title", "标题", 34, "w"),
+    "job": [("post_date", "日期", 9, "w"), ("region", "岗位类别", 9, "w"), ("title", "标题", 24, "w"),
             ("position", "职位", 12, "w"), ("nature", "性质", 6, "w"), ("salary_num", "时薪", 6, "e"),
-            ("distance", "距离 km", 9, "e"), ("loc_desc", "定位依据", 20, "w")],
+            ("mail", "邮箱", 5, "center"), ("distance", "距离 km", 9, "e"), ("loc_desc", "定位依据", 20, "w")],
 }
+MATCH_COLUMN = ("match", "匹配", 6, "e")     # 上传简历后加到招聘页
 DEFAULT_SORTS = {"rent": {"出租"}, "job": {"招聘"}}     # 默认只看出租 / 招聘, 不看求租 / 求职
 
 
@@ -213,6 +220,17 @@ class CategoryTab:
                   self.rent_type_var, self.house_type_var, self.pos_var):
             v.trace_add("write", lambda *a: self.refresh_soon())
 
+        # ---- 招聘页: 简历分析 + 邮件申请 ----
+        if not self.rent:
+            act = ttk.Frame(self.frame, padding=(0, 6, 0, 0))
+            act.pack(fill="x")
+            ttk.Button(act, text="上传简历…", command=app.choose_resume).pack(side="left")
+            self.resume_label = tk.StringVar(value="未上传简历 (上传后按匹配度给岗位打分, 只在本机分析)")
+            ttk.Label(act, textvariable=self.resume_label, foreground="#555").pack(side="left", padx=8)
+            ttk.Button(act, text="查看分析", command=app.show_resume_report).pack(side="left")
+            self.btn_mail = ttk.Button(act, text="✉ 邮件申请选中岗位", state="disabled", command=self.send_mail)
+            self.btn_mail.pack(side="right")
+
         # ---- 结果表 + 详情区 (可拖动分隔条调整高度) ----
         pw = ttk.Panedwindow(self.frame, orient="vertical")
         pw.pack(fill="both", expand=True, pady=(6, 0))
@@ -228,7 +246,7 @@ class CategoryTab:
         tf.columnconfigure(0, weight=1)
         df = ttk.Frame(pw)
         self.detail = tk.Text(df, height=6, wrap="word", relief="flat", padx=8, pady=6,
-                              background="#FAFAFA", state="disabled")
+                              background="#FAFAFA", state="disabled", font="TkDefaultFont")
         dsb = ttk.Scrollbar(df, orient="vertical", command=self.detail.yview)
         self.detail.configure(yscrollcommand=dsb.set)
         self.detail.pack(side="left", fill="both", expand=True)
@@ -236,19 +254,55 @@ class CategoryTab:
         pw.add(tf, weight=4)
         pw.add(df, weight=1)
 
-        ui = app.ui
-        self.columns = VIEW_COLUMNS[category]
-        self.tree["columns"] = [c[0] for c in self.columns]
-        for key, head, w, anchor in self.columns:
-            self.tree.heading(key, text=head, anchor=anchor, command=lambda kk=key: self.sort_by(kk))
-            self.tree.column(key, width=int(w * 8 * ui), minwidth=int(36 * ui), anchor=anchor,
-                             stretch=(key == "title"))
+        self.match_enabled = False
+        self.setup_columns()
         self.tree.tag_configure("coarse", foreground="#8A8A8A")
+        self.tree.bind("<ButtonRelease-1>", self._maybe_save_widths, add="+")
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
         self.tree.bind("<Double-1>", self.open_selected)
         self.tree.bind("<Return>", self.open_selected)
         self.tree.bind("<Control-c>", self.copy_selected)
         self.set_detail("抓取后在这里显示选中帖子的详细信息。双击或按回车在浏览器打开原帖。")
+
+    # ---- 列 ----
+    def view_columns(self):
+        cols = list(VIEW_COLUMNS[self.cat])
+        if self.match_enabled:
+            cols.insert(3, MATCH_COLUMN)
+        return cols
+
+    def setup_columns(self):
+        ui = self.app.ui
+        saved = (geo.load_config().get("col_widths") or {}).get(self.cat, {})
+        self.columns = self.view_columns()
+        self.tree["columns"] = [c[0] for c in self.columns]
+        for key, head, w, anchor in self.columns:
+            width = saved.get(key, w * 8)          # 保存的是 100% 缩放下的像素
+            self.tree.heading(key, text=head, anchor=anchor, command=lambda kk=key: self.sort_by(kk))
+            self.tree.column(key, width=int(width * ui), minwidth=int(30 * ui), anchor=anchor, stretch=False)
+
+    def _maybe_save_widths(self, e):
+        if self.tree.identify_region(e.x, e.y) == "separator":
+            self.save_column_widths()
+
+    def save_column_widths(self):
+        cfg = geo.load_config()
+        widths = cfg.setdefault("col_widths", {}).setdefault(self.cat, {})
+        for key, *_ in self.columns:
+            widths[key] = round(self.tree.column(key, "width") / self.app.ui)
+        geo.save_config(cfg)
+
+    def reset_column_widths(self):
+        cfg = geo.load_config()
+        (cfg.get("col_widths") or {}).pop(self.cat, None)
+        geo.save_config(cfg)
+        self.setup_columns()
+        self.refresh()
+
+    def enable_match_column(self, on: bool):
+        if on != self.match_enabled:
+            self.match_enabled = on
+            self.setup_columns()
 
     # ---- 数据 ----
     def set_items(self, items):
@@ -297,6 +351,11 @@ class CategoryTab:
         self._after = None
         core = self.core
         geo.compute_distances(self.items, self.app.home)
+        if not self.rent:
+            prof = self.app.profile
+            for it in self.items:
+                it.mail = "✉" if mail.job_emails(it) else ""
+                it.match = resume.match(prof, it) if prof else None
         crit = self.criteria()
         shown = core.apply_filters(self.items, crit)
         if self.sort_key:
@@ -370,9 +429,14 @@ class CategoryTab:
         self.detail.insert("1.0", text)
         self.detail.configure(state="disabled")
 
-    def on_select(self, _e=None):
+    def selected(self):
         sel = self.tree.selection()
-        it = self._find(sel[0]) if sel else None
+        return self._find(sel[0]) if sel else None
+
+    def on_select(self, _e=None):
+        it = self.selected()
+        if not self.rent:
+            self.btn_mail.configure(state="normal" if it and mail.job_emails(it) else "disabled")
         if not it:
             return
         home = self.app.home
@@ -389,8 +453,11 @@ class CategoryTab:
         else:
             lines.append(f"公司: {it.company}    职位: {it.position}    薪金: {it.salary}    性质: {it.nature}    "
                          f"地点: {it.location}    时间: {it.work_time}")
+        emails = mail.job_emails(it) if not self.rent else []
         lines.append(f"电话: {it.phone or '-'}    微信: {it.wechat or '-'}"
-                     + (f"    邮箱: {it.email}" if getattr(it, "email", "") else ""))
+                     + (f"    邮箱: {', '.join(emails)}" if emails else ""))
+        if not self.rent and self.app.profile:
+            lines.append(f"简历匹配度: {resume.match(self.app.profile, it)} / 100")
         for k, v in it.extra.items():
             lines.append(f"{k}: {v}")
         lines += ["", it.content]
@@ -401,6 +468,33 @@ class CategoryTab:
             it = self._find(iid)
             if it:
                 webbrowser.open(it.url)
+
+    def send_mail(self):
+        it = self.selected()
+        emails = mail.job_emails(it) if it else []
+        if not emails:
+            messagebox.showinfo("邮件申请", "选中的帖子没有留邮箱, 请用帖子里的电话或微信联系")
+            return
+        cfg = geo.load_config()
+        client = mail.detect_mail_client()
+        method = mail.choose_method(cfg.get("mail_method", "auto"), client, cfg.get("webmail", "gmail"))
+        summary = self.app.profile.summary() if self.app.profile else ""
+        subject = mail.fill(cfg.get("mail_subject") or mail.DEFAULT_SUBJECT, it, summary)
+        body = mail.fill(cfg.get("mail_body") or mail.DEFAULT_BODY, it, summary)
+        try:
+            mail.compose(emails[0], subject, body, method)
+        except OSError:
+            method = cfg.get("webmail", "gmail")              # 客户端打不开时退回网页邮箱
+            mail.compose(emails[0], subject, body, method)
+        where = mail.client_name(client) if method == "client" else mail.WEBMAIL[method]
+        msg = f"已在{where}打开写信窗口 (收件人 {emails[0]})"
+        rp = self.app.resume_path
+        if rp and os.path.exists(rp) and cfg.get("reveal_resume", True):
+            mail.reveal_file(rp)
+            msg += "; 已在资源管理器中选中简历, 请拖进邮件作为附件"
+        if len(emails) > 1:
+            msg += f"; 帖子里还有其他邮箱: {', '.join(emails[1:])}"
+        self.app.status.set(msg)
 
     def copy_selected(self, _e=None):
         rows = [self._find(i) for i in self.tree.selection()]
@@ -427,6 +521,10 @@ class App:
         cfg = geo.load_config()
         self.home = ((cfg["home_lat"], cfg["home_lon"], cfg.get("home_desc", ""))
                      if cfg.get("home_lat") is not None else None)
+        self.cache = store.PostCache()
+        self.profile = None                 # 简历分析结果
+        self.resume_path = ""
+        self.settings_dialog = None
 
         self._setup_window()
         self._build_toolbar()
@@ -447,6 +545,8 @@ class App:
         root.app = self   # 便于测试
 
         self.show_home_status()
+        self._load_resume_silently(cfg.get("resume_path", ""))
+        self.load_cached()
         self._on_tab_changed()
         self._poll()
 
@@ -469,17 +569,15 @@ class App:
     def _build_toolbar(self):
         bar = ttk.Frame(self.root, padding=(8, 8, 8, 4))
         bar.pack(fill="x")
-        ttk.Label(bar, text="最近天数:").pack(side="left")
-        self.days_var = tk.IntVar(value=10)
-        ttk.Spinbox(bar, from_=1, to=60, width=4, textvariable=self.days_var).pack(side="left", padx=(2, 10))
-        self.detail_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(bar, text="读取帖子详情 (租金 / 薪金等)", variable=self.detail_var).pack(side="left")
-        self.btn_fetch = ttk.Button(bar, text="开始抓取 (F5)", style="Accent.TButton", command=self.start_fetch)
-        self.btn_fetch.pack(side="left", padx=(12, 4))
+        self.btn_fetch = ttk.Button(bar, text="刷新 (F5)", style="Accent.TButton", command=self.start_fetch)
+        self.btn_fetch.pack(side="left", padx=(0, 4))
         self.btn_stop = ttk.Button(bar, text="停止", state="disabled", command=self.stop_task)
         self.btn_stop.pack(side="left", padx=4)
         self.btn_export = ttk.Button(bar, text="导出 Excel (Ctrl+E)", command=self.export)
         self.btn_export.pack(side="left", padx=4)
+        ttk.Button(bar, text="⚙ 设置", command=self.open_settings).pack(side="left", padx=4)
+        self.days_label = tk.StringVar()
+        ttk.Label(bar, textvariable=self.days_label, foreground="#2E6E2E").pack(side="left", padx=(8, 0))
         self.pbar = ttk.Progressbar(bar, length=int(180 * self.ui), mode="determinate")
         self.pbar.pack(side="left", padx=10)
         self.status = tk.StringVar(value="就绪")
@@ -527,8 +625,102 @@ class App:
 
     def _on_tab_changed(self):
         tab = self.current_tab()
-        self.btn_fetch.configure(text=f"抓取{tab.cfg['name']} (F5)")
+        self.btn_fetch.configure(text=f"刷新{tab.cfg['name']} (F5)")
         self.update_count()
+
+    # ---- 设置 / 缓存 ----
+    def display_days(self) -> int:
+        try:
+            return max(1, min(60, int(geo.load_config().get("display_days", DEFAULT_DAYS))))
+        except (TypeError, ValueError):
+            return DEFAULT_DAYS
+
+    def read_detail(self) -> bool:
+        return bool(geo.load_config().get("read_detail", True))
+
+    def load_cached(self):
+        days = self.display_days()
+        self.days_label.set(f"显示最近 {days} 天 (在设置中修改)")
+        for cat, tab in self.tabs.items():
+            tab.set_items(self.cache.load(cat, days))
+        last = [self.cache.get_meta(f"last_refresh_{c}") for c in self.tabs]
+        if any(last):
+            when = max(x for x in last if x).replace("T", " ")[:16]
+            self.status.set(f"已载入本地缓存 (最近刷新 {when}); 点「刷新」只抓新帖")
+
+    def open_settings(self):
+        if self.settings_dialog is not None and self.settings_dialog.winfo_exists():
+            self.settings_dialog.lift()
+            return
+        self.settings_dialog = SettingsDialog(self)
+
+    # ---- 简历 ----
+    def choose_resume(self):
+        path = filedialog.askopenfilename(title="选择简历", filetypes=[
+            ("简历 (PDF / Word / TXT)", "*.pdf *.docx *.txt"), ("所有文件", "*.*")])
+        if path:
+            self.load_resume(path)
+
+    def load_resume(self, path: str, show_report: bool = True) -> bool:
+        try:
+            prof = resume.analyze(resume.extract_text(path))
+        except resume.ResumeError as e:
+            messagebox.showwarning("简历", str(e))
+            return False
+        self.profile, self.resume_path = prof, path
+        cfg = geo.load_config()
+        cfg["resume_path"] = path
+        geo.save_config(cfg)
+        job = self.tabs["job"]
+        if prof.keywords:
+            job.resume_label.set(f"简历: {os.path.basename(path)} · 方向: {'、'.join(prof.categories[:3])}")
+        else:
+            job.resume_label.set(f"简历: {os.path.basename(path)} · 没有识别出技能关键词, 匹配度可能不准")
+        job.enable_match_column(True)
+        if job.sort_key is None:
+            job.sort_key, job.sort_rev = "match", True      # 上传后按匹配度从高到低
+        job.refresh()
+        if show_report:
+            self.show_resume_report()
+        return True
+
+    def _load_resume_silently(self, path):
+        if path and os.path.exists(path):
+            try:
+                self.profile = resume.analyze(resume.extract_text(path))
+                self.resume_path = path
+            except resume.ResumeError:
+                self.core.log.warning("启动时读取简历失败: %s", path)
+
+    def show_resume_report(self):
+        prof = self.profile
+        if not prof:
+            messagebox.showinfo("简历分析", "还没有上传简历")
+            return
+        job = self.tabs["job"]
+        top = sorted((it for it in job.items if getattr(it, "match", None)), key=lambda it: -it.match)[:10]
+        lines = [f"简历文件: {self.resume_path}", "（分析只在本机进行, 不会上传）", ""]
+        if prof.cat_hits:
+            lines.append("技能方向:")
+            lines += [f"  · {c}: {'、'.join(prof.cat_hits[c][:8])}" for c in prof.categories]
+        else:
+            lines.append("技能方向: 没有识别出来 (可以在简历里写明职位, 如 厨师 / 清洁 / 会计)")
+        lines += ["", f"语言: {'、'.join(prof.languages) or '未写明'}",
+                  f"证照: {'、'.join(prof.licences) or '未写明'}",
+                  f"签证: {prof.visa or '未写明'}",
+                  f"工作年限: {f'{prof.years} 年' if prof.years else '未写明'}",
+                  "", "匹配度计算: 岗位类别吻合 +35, 每个技能关键词 +15 (最多 45), "
+                      "满足 / 不满足 英语和驾照要求 ±10",
+                  "", f"当前招聘页匹配度最高的 {len(top)} 个岗位:"]
+        lines += [f"  {it.match:>3}  {it.title}" for it in top] or ["  (先刷新招聘页)"]
+        win = tk.Toplevel(self.root)
+        win.title("简历分析")
+        win.transient(self.root)
+        txt = tk.Text(win, width=70, height=26, wrap="word", padx=10, pady=8)
+        txt.insert("1.0", "\n".join(lines))
+        txt.configure(state="disabled")
+        txt.pack(fill="both", expand=True)
+        ttk.Button(win, text="关闭", command=win.destroy).pack(pady=6)
 
     def update_count(self):
         if not hasattr(self, "tabs"):
@@ -635,23 +827,18 @@ class App:
     # ---- 抓取 ----
     def start_fetch(self):
         tab = self.current_tab()
-        try:
-            days = max(1, min(60, int(self.days_var.get())))
-        except (tk.TclError, ValueError):
-            days = 10
-        self.days_var.set(days)
-        with_detail, online = self.detail_var.get(), self.online_var.get()   # 在主线程读取
-        stop = self.begin_task(f"抓取{tab.cfg['name']}", stoppable=True)
+        days, with_detail, online = self.display_days(), self.read_detail(), self.online_var.get()
+        stop = self.begin_task(f"刷新{tab.cfg['name']}", stoppable=True)
         if stop is None:
             return
-        cat = tab.cat
+        cat, cache = tab.cat, self.cache
 
         def work():
             sc = self.core.Scraper(log=lambda m: self.msgq.put(("log", m)), stop_event=stop)
-            items = sc.scrape(cat, days, with_detail=with_detail,
-                              progress=lambda d, t: self.msgq.put(("prog", (d, t))),
-                              online_geocode=online)
-            self.msgq.put(("fetched", (cat, items, stop.is_set())))
+            items, n_new = sc.refresh(cat, days, cache, with_detail=with_detail,
+                                      progress=lambda d, t: self.msgq.put(("prog", (d, t))),
+                                      online_geocode=online)
+            self.msgq.put(("fetched", (cat, items, stop.is_set(), n_new)))
         self._run(self.task, work)
 
     # ---- 住址 ----
@@ -703,9 +890,12 @@ class App:
         if stop is None:
             return
 
+        cache = self.cache
+
         def work():
             self.core.locate_items(items, True, log=lambda m: self.msgq.put(("log", m)),
                                    progress=lambda d, t: self.msgq.put(("prog", (d, t))), stop_event=stop)
+            cache.save(items)                   # 定位结果写回缓存
             self.msgq.put(("relocated", None))
         self._run(self.task, work)
 
@@ -757,13 +947,13 @@ class App:
                 self.pbar.configure(maximum=t, value=d)
                 self.status.set(f"{self.task or ''} {d}/{t}")
         elif kind == "fetched":
-            cat, items, stopped = data
+            cat, items, stopped, n_new = data
             self.end_task()
             tab = self.tabs[cat]
-            if items or not tab.items:
-                tab.set_items(items)
+            tab.set_items(items)
             name = tab.cfg["name"]
-            self.status.set(f"已停止, 保留 {len(items)} 条{name}" if stopped else f"完成, 抓取 {len(items)} 条{name}")
+            head = "已停止" if stopped else "刷新完成"
+            self.status.set(f"{head}: 新帖 {n_new} 条, 最近 {self.display_days()} 天共 {len(items)} 条{name}")
             self.update_count()
         elif kind == "home":
             self.end_task()
@@ -828,6 +1018,101 @@ class App:
             geo._geocoder.save()          # 每 10 条才自动保存一次, 关窗时补存
         self.save_prefs()
         self.root.destroy()
+
+
+class SettingsDialog(tk.Toplevel):
+    def __init__(self, app: App):
+        super().__init__(app.root)
+        self.app = app
+        self.title("设置")
+        self.transient(app.root)
+        self.resizable(False, False)
+        cfg = geo.load_config()
+        pad = {"padx": 10, "pady": 4}
+
+        data = ttk.LabelFrame(self, text="数据", padding=8)
+        data.pack(fill="x", **pad)
+        ttk.Label(data, text="显示最近").grid(row=0, column=0, sticky="w")
+        self.days_var = tk.IntVar(value=app.display_days())
+        ttk.Spinbox(data, from_=1, to=60, width=5, textvariable=self.days_var).grid(row=0, column=1, padx=4)
+        ttk.Label(data, text="天的帖子 (默认 10; 调大后点「刷新」会补抓更早的帖子)").grid(row=0, column=2, sticky="w")
+        self.detail_var = tk.BooleanVar(value=bool(cfg.get("read_detail", True)))
+        ttk.Checkbutton(data, text="读取帖子详情 (租金 / 薪金 / 地址 / 邮箱等, 关闭后刷新更快但信息少)",
+                        variable=self.detail_var).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        counts = "、".join(f"{t.cfg['name']} {app.cache.count(c)} 条" for c, t in app.tabs.items())
+        ttk.Label(data, text=f"本地缓存: {counts} (保存最近 60 天)", foreground="#555").grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Button(data, text="清空本地缓存", command=self.clear_cache).grid(row=2, column=2, sticky="e", pady=(6, 0))
+
+        m = ttk.LabelFrame(self, text="邮件申请", padding=8)
+        m.pack(fill="x", **pad)
+        client = mail.detect_mail_client()
+        ttk.Label(m, text="发送方式:").grid(row=0, column=0, sticky="w")
+        self.method_var = tk.StringVar(value=mail.METHODS.get(cfg.get("mail_method", "auto"), mail.METHODS["auto"]))
+        ttk.Combobox(m, width=40, state="readonly", textvariable=self.method_var,
+                     values=list(mail.METHODS.values())).grid(row=0, column=1, sticky="w", padx=4)
+        ttk.Label(m, text=f"检测到的邮件客户端: {mail.client_name(client)}", foreground="#555").grid(
+            row=1, column=1, sticky="w", padx=4)
+        ttk.Label(m, text="没有客户端时用:").grid(row=2, column=0, sticky="w")
+        self.webmail_var = tk.StringVar(value=mail.WEBMAIL.get(cfg.get("webmail", "gmail")))
+        ttk.Combobox(m, width=40, state="readonly", textvariable=self.webmail_var,
+                     values=list(mail.WEBMAIL.values())).grid(row=2, column=1, sticky="w", padx=4)
+        ttk.Label(m, text="邮件主题:").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        self.subject_var = tk.StringVar(value=cfg.get("mail_subject") or mail.DEFAULT_SUBJECT)
+        ttk.Entry(m, width=60, textvariable=self.subject_var).grid(row=3, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(m, text="邮件正文:").grid(row=4, column=0, sticky="nw", pady=(6, 0))
+        self.body_text = tk.Text(m, width=60, height=7, wrap="word")
+        self.body_text.insert("1.0", cfg.get("mail_body") or mail.DEFAULT_BODY)
+        self.body_text.grid(row=4, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(m, text="可用占位符: {职位} {公司} {标题} {链接} {简历摘要}", foreground="#555").grid(
+            row=5, column=1, sticky="w", padx=4)
+        self.reveal_var = tk.BooleanVar(value=bool(cfg.get("reveal_resume", True)))
+        ttk.Checkbutton(m, text="打开写信窗口时在资源管理器中选中简历 (邮件链接无法自动带附件)",
+                        variable=self.reveal_var).grid(row=6, column=1, sticky="w", padx=4, pady=(4, 0))
+
+        t = ttk.LabelFrame(self, text="表格", padding=8)
+        t.pack(fill="x", **pad)
+        ttk.Label(t, text="拖动表头边缘可调整列宽, 程序会记住。").pack(side="left")
+        ttk.Button(t, text="恢复默认列宽", command=self.reset_widths).pack(side="right")
+
+        b = ttk.Frame(self, padding=8)
+        b.pack(fill="x")
+        ttk.Button(b, text="确定", command=self.apply).pack(side="right", padx=4)
+        ttk.Button(b, text="取消", command=self.destroy).pack(side="right")
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    def _key(self, mapping, label, default):
+        return next((k for k, v in mapping.items() if v == label), default)
+
+    def apply(self):
+        try:
+            days = max(1, min(60, int(self.days_var.get())))
+        except (tk.TclError, ValueError):
+            days = DEFAULT_DAYS
+        cfg = geo.load_config()
+        old_days = cfg.get("display_days", DEFAULT_DAYS)
+        cfg.update(display_days=days, read_detail=self.detail_var.get(),
+                   mail_method=self._key(mail.METHODS, self.method_var.get(), "auto"),
+                   webmail=self._key(mail.WEBMAIL, self.webmail_var.get(), "gmail"),
+                   mail_subject=self.subject_var.get().strip() or mail.DEFAULT_SUBJECT,
+                   mail_body=self.body_text.get("1.0", "end").rstrip() + "\n",
+                   reveal_resume=self.reveal_var.get())
+        geo.save_config(cfg)
+        self.destroy()
+        if days != old_days:
+            self.app.load_cached()
+            if days > old_days:
+                self.app.status.set(f"已改为显示最近 {days} 天; 点「刷新」补抓更早的帖子")
+
+    def clear_cache(self):
+        if messagebox.askyesno("清空本地缓存", "删除所有已缓存的帖子? 下次刷新会重新抓取。", parent=self):
+            self.app.cache.clear()
+            self.app.load_cached()
+            self.destroy()
+
+    def reset_widths(self):
+        for tab in self.app.tabs.values():
+            tab.reset_column_widths()
 
 
 def run(core):
